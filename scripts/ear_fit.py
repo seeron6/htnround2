@@ -183,75 +183,23 @@ def ear_vertex_labels(count, regions):
 def refine_ear_ownership(
     folder, p, faces, regions, semantics, rec, center, B, transform
 ):
-    """Remove adjacent skull vertices from ear ownership using source views."""
-    import trimesh
-    from scripts.photo_geometry import zbuffer
+    """Retain anatomical material identity independently of photo visibility.
 
-    detail_path = folder / 'photo-detail.json'
-    detail = (
-        {
-            v['filename']: v
-            for v in json.loads(detail_path.read_text()).get('frames', [])
-        }
-        if detail_path.exists()
-        else {}
-    )
-    labels = ear_vertex_labels(len(p), regions)
-    votes = np.zeros(len(p))
-    seen = np.zeros(len(p))
-    world = p / transform['scale'] @ B + center
-    normal = np.asarray(trimesh.Trimesh(p, faces, process=False).vertex_normals) @ B
-    images = {im.name: im for im in rec.images.values()}
-    for view in semantics['views']:
-        im = images.get(view['filename'])
-        if im is None:
-            continue
-        cam = rec.cameras[im.camera_id]
-        pose = im.cam_from_world()
-        cp = world @ pose.rotation.matrix().T + pose.translation
-        xy = cam.img_from_cam(cp)
-        ij = np.rint(np.nan_to_num(xy, nan=-1, posinf=-1, neginf=-1)).astype(int)
-        inside = (
-            (ij[:, 0] >= 0)
-            & (ij[:, 0] < cam.width)
-            & (ij[:, 1] >= 0)
-            & (ij[:, 1] < cam.height)
-            & (cp[:, 2] > 0)
-        )
-        x = np.clip(ij[:, 0], 0, cam.width - 1)
-        y = np.clip(ij[:, 1], 0, cam.height - 1)
-        depth = zbuffer(xy, cp[:, 2], faces, cam.width, cam.height)
-        toward = im.projection_center() - world
-        toward /= np.maximum(np.linalg.norm(toward, axis=1, keepdims=True), 1e-9)
-        facing = np.maximum(np.sum(normal * toward, axis=1), 0)
-        weight = (
-            facing**2
-            * inside
-            * (np.abs(cp[:, 2] - depth[y, x]) * transform['scale'] < 0.006)
-            * (labels > 0)
-        )
-        scale = detail.get(im.name, {}).get('size', [cam.width])[0] / cam.width
-        mask, _ = source_ear_mask(
-            (cam.height, cam.width),
-            im.name,
-            semantics,
-            (im.projection_center() - center) @ B.T,
-            scale,
-        )
-        mask = cv2.dilate(mask, np.ones((5, 5), np.uint8))
-        seen += weight
-        votes += weight * (mask[y, x] == labels)
-    supported = (seen < 0.15) | (votes >= seen * 0.4)
+    Cutout alpha, source-ear masks and occlusion determine usable appearance
+    evidence; they cannot remove vertices from the accepted anatomical ear.
+    Restore the original core when an earlier visibility pass pruned it.
+    """
     audit = {}
     for sign, region in regions.items():
-        before = region['coreVertices']
-        region.setdefault('anatomicalCoreVertices', before.copy())
-        region['coreVertices'] = [i for i in before if supported[i]]
+        anatomical = list(region.get('anatomicalCoreVertices', region['coreVertices']))
+        # Separate copies prevent later edits to the active ownership list from
+        # silently changing the retained anatomical correspondence.
+        region['anatomicalCoreVertices'] = anatomical.copy()
+        region['coreVertices'] = anatomical.copy()
         audit[sign] = {
-            'templateVertices': len(before),
-            'earVertices': len(region['coreVertices']),
-            'reclassifiedAdjacentSurface': len(before) - len(region['coreVertices']),
-            'method': 'Visibility-weighted agreement with photographed ear outlines; hidden vertices retain the prior.',
+            'earVertices': len(anatomical),
+            'method': 'Anatomical material identity retained independently of photographic visibility',
+            'geometryChanged': False,
         }
     return audit
 
@@ -278,6 +226,22 @@ def source_ear_mask(shape, filename, semantics, origin, pixel_scale):
         points = np.rint((outline * extent + crop[:2]) / pixel_scale).astype(np.int32)
         cv2.fillPoly(mask, [points], 3 if sign < 0 else 4)
     return cv2.dilate(mask, np.ones((3, 3), np.uint8)), True
+
+
+def affine_sample_coordinates(xy, matrix):
+    """Apply a 2D affine transform with explicit, row-independent arithmetic.
+
+    Fresh concurrent capture bakes exposed sparse, large coordinate errors in
+    the previous tall Nx2 matrix-product path. Explicit products avoid that
+    path and give full-view/subset projections the same operation order. The
+    capture replay, not a synthetic product benchmark, is the regression gate.
+    """
+    return np.column_stack(
+        [
+            xy[:, 0] * matrix[i, 0] + xy[:, 1] * matrix[i, 1] + matrix[i, 2]
+            for i in range(2)
+        ]
+    )
 
 
 def ear_sample_coordinates(
@@ -339,12 +303,12 @@ def ear_sample_coordinates(
             continue
         owned = parts == (3 if sign < 0 else 4)
         if registration_weights is None:
-            output[owned] = xy[owned] @ matrix[:, :2].T + matrix[:, 2]
+            output[owned] = affine_sample_coordinates(xy[owned], matrix)
         else:
             weight = registration_weights.get(str(sign), np.zeros(len(xy))).copy()
             weight[owned] = 1
             active = weight > 1e-6
-            corrected = xy[active] @ matrix[:, :2].T + matrix[:, 2]
+            corrected = affine_sample_coordinates(xy[active], matrix)
             output[active] += (corrected - xy[active]) * weight[active, None]
     return output
 

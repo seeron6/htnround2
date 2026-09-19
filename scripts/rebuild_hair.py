@@ -99,6 +99,24 @@ def update_refit_baseline(stage, before, after):
     if not np.isfinite(updated).all():
         raise ValueError('Hair refit produced an invalid pre-ear baseline.')
     payload['positions'] = updated
+    if any(key.startswith('contourRest') for key in payload):
+        from scripts.ear_contour_rest import contour_rest_fields, load_contour_rest
+
+        measurements_path = stage / 'ear-measurements.json'
+        if not measurements_path.is_file():
+            raise ValueError('Hair refit requires saved contour-rest ear measurements.')
+        measurements = json.loads(measurements_path.read_text())
+        contour_rest = load_contour_rest(
+            payload,
+            old,
+            faces,
+            before['stats']['observedFaceTriangles'],
+            measurements,
+        )
+        # Transport the separate post-ear stage input explicitly. Re-running
+        # nonlinear ear fitting on the revised earlier baseline is not equivalent.
+        contour_rest[moved] += delta[moved]
+        payload.update(contour_rest_fields(contour_rest, faces, measurements))
     temporary = stage / '.pending-hair-baseline.npz'
     np.savez_compressed(temporary, **payload)
     temporary.replace(path)

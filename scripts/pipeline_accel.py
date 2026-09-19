@@ -31,7 +31,7 @@ import numpy as np
 PINS = {
     'zbuffer': '5c87c8242c7a354a2e19c681b490fa148999a20db35d658a346ede54db883794',
     'raster_atlas': 'c7f924eb102509d823aabe622e7ff4a6163b6f795e24f8501e2cd5e752cc5eb0',
-    'prepare_detail_frames': 'a37295636faa41fbb2280e6cb66dafd45fb70cd0491884664fdbc13529c67de0',
+    'prepare_detail_frames': '35d4508f511765d747ccc7419e12c2fe085da8c12efde24448c380c8a925c6a5',
 }
 WORKERS = max(2, min(8, (os.cpu_count() or 4) - 2))
 _pool = ThreadPoolExecutor(WORKERS, thread_name_prefix='accel')
@@ -258,12 +258,18 @@ def stream_detail_frames(folder, workers=8):
     import cv2
     from PIL import Image
     from face_pipeline import atomic
+    from scripts.detail_color import fuse_native_detail
+    from scripts.photo_detail import (
+        DETAIL_CACHE_VERSIONS,
+        DETAIL_VERSION,
+        DETAIL_SOURCE,
+    )
 
     folder = Path(folder)
     manifest = folder / 'photo-detail.json'
     if manifest.exists():
         cached = json.loads(manifest.read_text())
-        if cached.get('version') == 2:
+        if cached.get('version') in DETAIL_CACHE_VERSIONS:
             return cached
     video = folder / 'source-video'
     if not video.exists():
@@ -288,6 +294,8 @@ def stream_detail_frames(folder, workers=8):
         )
         h, w = captured.shape[:2]
         valid = captured[:, :, 3] > 220
+        if not valid.any():
+            return None
         best = None
         for index, bgr in candidates:
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -304,29 +312,7 @@ def stream_detail_frames(folder, workers=8):
         if best is None or best[0] > 12:
             return None
         error, index, rgb = best
-        registered = cv2.resize(
-            captured[:, :, :3],
-            (rgb.shape[1], rgb.shape[0]),
-            interpolation=cv2.INTER_CUBIC,
-        ).astype(np.float32)
-        native = rgb.astype(np.float32)
-        sigma = 1.4 * rgb.shape[1] / w
-        rgb = np.uint8(
-            np.clip(
-                cv2.GaussianBlur(registered, (0, 0), sigma)
-                + native
-                - cv2.GaussianBlur(native, (0, 0), sigma),
-                0,
-                255,
-            )
-        )
-        alpha = cv2.resize(
-            captured[:, :, 3],
-            (rgb.shape[1], rgb.shape[0]),
-            interpolation=cv2.INTER_NEAREST,
-        )
-        rgba = np.dstack([rgb, alpha])
-        rgba[alpha == 0, :3] = 0
+        rgba, fusion = fuse_native_detail(captured, rgb)
         Image.fromarray(rgba).save(output / frame['filename'])
         return {
             'filename': frame['filename'],
@@ -335,6 +321,7 @@ def stream_detail_frames(folder, workers=8):
             'matchError255': round(error, 3),
             'size': [rgb.shape[1], rgb.shape[0]],
             'registeredSize': [w, h],
+            'colorFusion': fusion,
         }
 
     # A view is dispatched once its last candidate has streamed past, so
@@ -376,11 +363,8 @@ def stream_detail_frames(folder, workers=8):
     finally:
         decoder.release()
     result = {
-        'version': 2,
-        'source': (
-            'Original video detail at matched timestamps; colour matched to '
-            'registered browser-decoded frames; no super-resolution'
-        ),
+        'version': DETAIL_VERSION,
+        'source': DETAIL_SOURCE,
         'frames': [a for a in audit if a],
     }
     atomic(manifest, result)

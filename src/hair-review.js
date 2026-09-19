@@ -75,6 +75,15 @@ async function start() {
     scene.add(light);
   }
   let active;
+  function setPhotograph() {
+    const useSource = Boolean(active.sourcePhoto) && !$('cutout').checked;
+    $('photo').src = $('overlay-photo').src = asset(
+      useSource ? active.sourcePhoto : active.photo,
+    );
+    $('source-kind').textContent = useSource
+      ? 'Unmasked video frame. Compare outlines and accessory placement; source decoding and scene lighting can change apparent color.'
+      : 'Segmented capture. The cutout can omit real hair and glasses; missing pixels are not evidence that a feature was absent.';
+  }
   function render() {
     if (active) renderer.render(scene, camera);
   }
@@ -98,7 +107,8 @@ async function start() {
     renderer.setSize((height * w) / h, height);
     renderer.domElement.style.height = '100%';
     renderer.domElement.style.width = 'auto';
-    $('photo').src = $('overlay-photo').src = asset(view.photo);
+    $('cutout').disabled = !view.sourcePhoto;
+    setPhotograph();
     const sourceLabel = Number.isFinite(view.time)
       ? `Video ${view.time.toFixed(2)}s`
       : `Saved frame ${view.name}`;
@@ -123,6 +133,7 @@ async function start() {
     if (hair) hair.visible = $('fibers').checked && !clay.visible;
     render();
   };
+  $('cutout').onchange = setPhotograph;
   $('glasses').onchange = () => {
     if (glasses) glasses.visible = $('glasses').checked && !clay.visible;
     render();

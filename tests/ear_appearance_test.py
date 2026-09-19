@@ -24,7 +24,7 @@ class EarAppearanceTests(unittest.TestCase):
         result = hidden_scalp_completion(
             np.ones(101),
             np.zeros(101),
-            np.ones(101),
+            np.zeros(101),
             np.ones(101),
             np.zeros(101),
             support,
@@ -57,10 +57,33 @@ class EarAppearanceTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(result, 0)
 
+    def test_partial_occlusion_counts_hidden_mass_once_in_the_fraction(self):
+        # 40% hidden ear, 40% unmasked photo, 20% accessory estimate.
+        # The prior code used .4/(.4+.2), overstating occlusion as 67%.
+        result = hidden_scalp_completion(
+            np.array([0.4, 4.0]),
+            np.array([0.4, 4.0]),
+            np.array([0.2, 2.0]),
+            np.ones(2),
+            np.zeros(2),
+            np.zeros(2),
+        )
+        np.testing.assert_allclose(result, 7 / 27)
+        self.assertTrue(np.all(result < 0.3))
+        no_override = hidden_scalp_completion(
+            np.array([0.2]),
+            np.array([0.8]),
+            np.zeros(1),
+            np.ones(1),
+            np.zeros(1),
+            np.zeros(1),
+        )
+        np.testing.assert_array_equal(no_override, 0)
+
     def test_missing_observation_retains_existing_completion_strength(self):
         hidden = np.array([0.0, 0.5, 1.0])
         result = hidden_scalp_completion(
-            hidden, 1 - hidden, hidden, np.full(3, 0.8), np.zeros(3), np.zeros(3)
+            hidden, 1 - hidden, np.zeros(3), np.full(3, 0.8), np.zeros(3), np.zeros(3)
         )
         np.testing.assert_allclose(result, [0, 0.4, 0.8])
 

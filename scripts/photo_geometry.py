@@ -444,6 +444,7 @@ def bake_photographs(
     semantics=None,
     ear_regions=None,
     output_folder=None,
+    experimental_ear_donor_evidence=False,
 ):
     output_folder = folder if output_folder is None else output_folder
     detail_audit = prepare_detail_frames(folder)
@@ -473,7 +474,11 @@ def bake_photographs(
         ear_sample_coordinates,
         predicted_ear_mask,
     )
-    from scripts.glasses_reference import load_references, surface_coverage
+    from scripts.glasses_reference import (
+        cleanup_weights,
+        load_references,
+        supported_cleanup_coverage,
+    )
 
     clean_references = load_references(folder)
     # Photographic visibility can narrow valid color observations, but must
@@ -655,7 +660,12 @@ def bake_photographs(
         cleaned_coverage=cleaned_coverage,
     )
 
-    def project_view(im, sample_indices=None):
+    # This experimental field is frozen before either full-view accumulation
+    # or ownership's subset re-projection. It never changes anatomical labels.
+    ear_donor_multiplier = None
+    ear_donor_audit = None
+
+    def project_view(im, sample_indices=None, *, ear_evidence_only=False):
         cam = rec.cameras[im.camera_id]
         pose = im.cam_from_world()
         R = pose.rotation.matrix()
@@ -820,6 +830,35 @@ def bake_photographs(
         boundary_distance = distance_transform_edt(base_alpha > 128)
         edge_weight = np.clip(boundary_distance[sy, sx] / 10.0, 0, 1)
         edge_weight = edge_weight * edge_weight * (3 - 2 * edge_weight)
+        if ear_evidence_only:
+            from scripts.ear_donor_projection import projected_ear_observations
+
+            masked_evidence = (
+                cv2.resize(opaque_mask, (w, h), interpolation=cv2.INTER_NEAREST)[sy, sx]
+                > 0
+            )
+            if reference_mask is not None:
+                masked_evidence |= (
+                    cv2.resize(reference_mask, (w, h), interpolation=cv2.INTER_NEAREST)[
+                        sy, sx
+                    ]
+                    > 0
+                )
+            return near, projected_ear_observations(
+                semantics,
+                im.name,
+                im.name,
+                (im.projection_center() - center) @ B.T,
+                (w, h),
+                raw,
+                sample_projection,
+                parts,
+                inside=inside & sample_inside,
+                visible=visible,
+                facing=facing,
+                edge=edge_weight,
+                masked=masked_evidence,
+            )
         quality = (
             facing**8
             * inside
@@ -851,6 +890,8 @@ def bake_photographs(
                 ear_mask = predicted_ear_mask(
                     (h, w), ear_regions, im, cam, center, B, transform
                 )
+                if ear_donor_multiplier is not None:
+                    quality *= ear_donor_multiplier[near]
             source_part = ear_mask[sy, sx]
             # The ear outline is an approximate annotation. Its antialiased
             # rim must not become a second pink ear painted onto the scalp.
@@ -1035,9 +1076,6 @@ def bake_photographs(
                 mode='constant',
                 cval=0,
             )
-            strength = quality * preference * alpha * (~ear_surface)
-            cleaned_total += strength
-            cleaned_color += rgb * strength[:, None]
             usable = (
                 inside
                 * sample_inside
@@ -1061,10 +1099,18 @@ def bake_photographs(
                 mode='constant',
                 cval=0,
             )
-            coverage = np.maximum(
-                alpha * smooth_region(quality * preference / 0.02) * (~ear_surface),
-                surface_coverage(alpha, facing, usable, side_mix) * opaque_alpha,
+            strength, coverage = cleanup_weights(
+                alpha,
+                quality,
+                preference,
+                facing,
+                usable,
+                side_mix,
+                opaque_alpha,
+                ear_surface | erased_ear,
             )
+            cleaned_total += strength
+            cleaned_color += rgb * strength[:, None]
             cleaned_coverage = np.maximum(cleaned_coverage, coverage)
         masked = (
             cv2.resize(accessory_mask, (w, h), interpolation=cv2.INTER_NEAREST)[sy, sx]
@@ -1140,6 +1186,34 @@ def bake_photographs(
         return near, contributions, maxima, detail_best, fine_detail, visible_any, audit
 
     views = [im for im in train if im.name in selected]
+    if experimental_ear_donor_evidence and semantics and ear_regions:
+        from scripts.ear_donor_evidence import predicted_ear_donor_multiplier
+
+        ear_ids = np.flatnonzero(ear_surface)
+        local_ids = np.full(len(texel), -1, np.int32)
+        local_ids[ear_ids] = np.arange(len(ear_ids))
+        annotated_names = {view['filename'] for view in semantics.get('views', [])}
+        observations = []
+        for im in views:
+            if im.name not in annotated_names:
+                continue
+            near, measured = project_view(im, ear_ids, ear_evidence_only=True)
+            for observation in measured:
+                negative = np.zeros(len(ear_ids), np.float32)
+                positive = np.zeros(len(ear_ids), bool)
+                negative[local_ids[near]] = observation['negative']
+                positive[local_ids[near]] = observation['positive']
+                observations.append(
+                    {**observation, 'negative': negative, 'positive': positive}
+                )
+        multiplier, ear_donor_audit = predicted_ear_donor_multiplier(
+            observations, len(ear_ids)
+        )
+        ear_donor_multiplier = np.ones(len(texel), np.float32)
+        ear_donor_multiplier[ear_ids] = multiplier
+        ear_donor_multiplier.setflags(write=False)
+        ear_donor_audit['surfaceEarSamples'] = len(ear_ids)
+        print('Annotated ear donor evidence', json.dumps(ear_donor_audit), flush=True)
     workers = max(1, min(4, int(os.environ.get('CONTACT_BAKE_WORKERS', '4'))))
     from scripts.camera_texture import CameraTexture
 
@@ -1183,6 +1257,12 @@ def bake_photographs(
             hair_semantic_best,
         )
         color[revised_ids] = revised_low + fine_detail[revised_ids]
+    # Keep actual unmasked photo color separate from later estimated layers.
+    # Ear occlusion may leave connected head patches with no usable viewpoint.
+    ear_surface_enabled = bool(head_capture and ear_regions) and np.any(
+        ear_hidden_total > 0
+    )
+    ear_photo_color = color.copy() if ear_surface_enabled else None
     # A tiny grazing or unregistered view is not better evidence than a clean
     # estimate in the owning frontal exposure. Previously any nonzero sample
     # could reintroduce a second rim from a weaker side photograph.
@@ -1190,6 +1270,7 @@ def bake_photographs(
         color, total, estimated_color, estimated_total
     )
     cleaned = cleaned_total > 1e-7
+    cleaned_coverage = supported_cleanup_coverage(cleaned_coverage, cleaned_total)
     lighting_matched = 0
     if cleaned.any():
         clean_color = np.divide(
@@ -1222,6 +1303,7 @@ def bake_photographs(
         supported_color_reference = snapshot_supported_colors(
             color, parts, best, cleaned_coverage, bottom
         )
+    ear_prepared_color = color.copy() if ear_surface_enabled else None
     rear_path = folder / 'rear-prediction/rear.png'
     inferred = ~observed & (best < 0.08)
     rear = rear_reference(rear_path) if head_capture and rear_path.exists() else None
@@ -1316,9 +1398,27 @@ def bake_photographs(
             scalp,
             parts,
             np.maximum(best, hair_support),
+            cleanup_coverage=cleaned_coverage,
         )
         color = color * (1 - hidden_hair[:, None]) + inferred_rgb * hidden_hair[:, None]
         skin_completion_delta *= 1 - hidden_hair[:, None]
+        from scripts.crown_material import complete_crown
+
+        color, crown_audit = complete_crown(
+            color,
+            texel,
+            tn,
+            p,
+            p,
+            completion,
+            scalp,
+            np.maximum(best, hair_support),
+            preserve=observed
+            | (parts != 0)
+            | bottom
+            | (cleaned_coverage > 0)
+            | (estimated_best > 0),
+        )
     # A complete template contains hidden mouth surfaces and the backs of the
     # eyeballs. Those are not failed facial photographs. Measure coverage on
     # the exposed surface and give hidden internal anatomy a neutral material.
@@ -1357,6 +1457,8 @@ def bake_photographs(
     lower_skin_texels = 0
     ear_skin_texels = 0
     lower_surface = None
+    ear_surface_audit = None
+    attachment_audit = None
     if head_capture:
         from scripts.skin_continuation import continue_lower_skin, continue_ear_skin
 
@@ -1385,6 +1487,56 @@ def bake_photographs(
             preserve=mouth | bottom,
             pre_completion_color=color - skin_completion_delta,
         )
+        if ear_surface_enabled:
+            from scripts.ear_surface_material import complete_masked_ear_surface
+
+            color, ear_surface_audit = complete_masked_ear_surface(
+                p,
+                f,
+                surface_binding,
+                labels,
+                parts,
+                color,
+                photographic_color=ear_photo_color,
+                prepared_color=ear_prepared_color,
+                ear_hidden=ear_hidden_total,
+                total=total,
+                estimated_total=estimated_total,
+                best=best,
+                hair_support=hair_support,
+                hair_accum=hair_accum,
+                hair_total=hair_total,
+                hair_votes=hair_votes,
+                hair_visibility=hair_visibility,
+                hair_semantic_best=hair_semantic_best,
+                preserve=mouth | bottom | (cleaned_coverage > 0),
+            )
+        if ear_regions:
+            from scripts.attachment_continuation import continue_attachment_color
+
+            observed_hair = (hair_semantic_best > 0.30) & (
+                hair_votes >= hair_visibility * 0.75
+            )
+            joined, attachment_audit = continue_attachment_color(
+                p,
+                f,
+                surface_binding,
+                labels,
+                parts,
+                color,
+                support=np.maximum(best, hair_support),
+                preserve=mouth
+                | bottom
+                | observed
+                | observed_hair
+                | (cleaned_coverage > 0),
+            )
+            changed_attachment = np.any(joined != color, axis=1)
+            attachment_audit['changedUnprotectedInpaintEstimateTexels'] = int(
+                np.count_nonzero(changed_attachment & (estimated_best > 0))
+            )
+            attachment_audit['measuredFaceAndObservedHairPreserved'] = True
+            color = joined
     eye_texels = 0
     socket_shading = None
     if eyes:
@@ -1539,6 +1691,8 @@ def bake_photographs(
         lensInteriorsExcluded=bool(clean_references),
         skinDetail='3072px photographic color; observed eyes, eyebrows and hair preserved',
     )
+    if ear_donor_audit is not None:
+        metadata['stats']['experimentalEarDonorEvidence'] = ear_donor_audit
     metadata['stats']['eyes'] = (
         eyes['summary']
         if eyes
@@ -1548,6 +1702,13 @@ def bake_photographs(
     if socket_shading:
         metadata['stats']['eyeSocketShading'] = socket_shading
     metadata['stats']['nativeVideoDetailViews'] = len(detail_audit['frames'])
+    if head_capture:
+        metadata['stats']['crownCompletion'] = crown_audit
+        metadata['stats']['crownMapping'] = (
+            'Capture-fitted Cartesian crown detail; photographed hair preserved'
+            if crown_audit['applied']
+            else metadata['stats']['crownMapping']
+        )
     metadata['stats']['fineDetail'] = (
         'Native video pixels; a single visible camera owns fine eyebrow, beard '
         'and hair texture; only broad color is blended.'
@@ -1613,6 +1774,10 @@ def bake_photographs(
     if lower_surface:
         metadata['stats']['lowerSurfaceContinuation'] = lower_surface
     metadata['stats']['estimatedEarSkinTexels'] = ear_skin_texels
+    if ear_surface_audit is not None:
+        metadata['stats']['estimatedEarOccludedHeadAppearance'] = ear_surface_audit
+    if attachment_audit is not None:
+        metadata['stats']['estimatedHeadEarAttachment'] = attachment_audit
     metadata['stats']['faceCoverageRegion'] = (
         'Visible skin within the measured facial outline; excludes unobserved '
         'crown, neck, eyeballs and hidden cavities.'

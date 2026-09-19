@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Meshy × Punching Face — same-video comparison</title>
+    <link rel="stylesheet" href="/src/engine-comparison.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <a href="/">← Punching Face</a
+        ><span class="eyebrow">RECONSTRUCTION STUDY / 01</span>
+        <h1>One face. Two pipelines.</h1>
+        <p>
+          Real outputs from the same video. Rotate either model to move both; scroll to
+          zoom.
+        </p>
+      </header>
+      <div class="toolbar">
+        <nav aria-label="Camera angle">
+          <button data-angle="0" aria-pressed="true">Front</button>
+          <button data-angle="-45">¾ left</button
+          ><button data-angle="45">¾ right</button>
+          <button data-angle="90">Left profile</button
+          ><button data-angle="-90">Right profile</button
+          ><button data-angle="180">Back</button>
+          <button data-angle="40" data-elevation="65">Above</button
+          ><button data-angle="40" data-elevation="-65">Underneath</button>
+        </nav>
+        <nav aria-label="Appearance">
+          <button data-mode="texture" aria-pressed="true">Texture</button>
+          <button data-mode="clay">Shape</button
+          ><button data-mode="wire">Wireframe</button>
+        </nav>
+        <button id="reset">Reset view</button>
+      </div>
+      <section class="comparison" aria-label="3D model comparison">
+        <article>
+          <div class="model-heading">
+            <h2 id="native-label">Punching Face</h2>
+            <span id="native-kind">PHOTO-FITTED</span>
+          </div>
+          <div
+            class="stage"
+            id="native-stage"
+            aria-label="Interactive Punching Face model"
+          ></div>
+          <p id="native-stats" class="stats">Loading the saved model…</p>
+          <a id="try-native" hidden>Try this candidate in Punching Face →</a>
+        </article>
+        <article>
+          <div class="model-heading">
+            <h2>Meshy</h2>
+            <span>AI-GENERATED</span>
+          </div>
+          <div class="stage" id="meshy-stage" aria-label="Interactive Meshy model">
+            <div id="meshy-pending" role="status">Preparing the Meshy model…</div>
+          </div>
+          <p id="meshy-stats" class="stats">Waiting for Meshy…</p>
+        </article>
+      </section>
+      <div class="caption">
+        <p id="render-note">
+          Matching cameras and display height. Skin retains photographed lighting;
+          separate eyewear uses physical materials. Shape uses the same neutral material
+          and lighting.
+        </p>
+        <label
+          >Meshy front alignment
+          <select id="meshy-yaw">
+            <option value="0">0°</option>
+            <option value="90">90°</option>
+            <option value="180">180°</option>
+            <option value="270">270°</option>
+          </select></label
+        >
+      </div>
+      <section class="source-section">
+        <div>
+          <span class="eyebrow">THE SHARED SOURCE</span>
+          <h2 id="source-name">Your saved video</h2>
+          <p id="source-note"></p>
+          <p class="small">
+            These are the exact cropped views submitted to Meshy. Select a photo to
+            enlarge it.
+          </p>
+        </div>
+        <div id="source-views"></div>
+      </section>
+      <section class="methods">
+        <div>
+          <h2>How Punching Face built it</h2>
+          <ol id="native-method">
+            <li>Extract video frames and recover camera positions.</li>
+            <li>
+              Fit a full-head template to facial landmarks and photographed silhouettes.
+            </li>
+            <li>
+              Project and blend photos into a texture atlas; estimate unseen surfaces.
+            </li>
+            <li>Add separate hair detail, glasses and a Newton physics cage.</li>
+          </ol>
+          <p>
+            Check likeness, texture seams, ear shape, hair silhouette and estimated neck
+            / rear regions.
+          </p>
+        </div>
+        <div>
+          <h2>How Meshy built it</h2>
+          <ol>
+            <li>
+              Select the front, two side views and a far-side view from the same scan.
+            </li>
+            <li>Send those cropped images to Meshy’s multi-image-to-3D service.</li>
+            <li>
+              Generate geometry and textures, then remesh toward 30,000 triangles.
+            </li>
+            <li>
+              Download the textured GLB. Our import path adds preview deformation.
+            </li>
+          </ol>
+          <p>
+            Check whether the generated face preserves your proportions, glasses and
+            hairstyle. This build does not include our Newton cage.
+          </p>
+          <a
+            href="https://docs.meshy.ai/en/api/multi-image-to-3d"
+            target="_blank"
+            rel="noreferrer"
+            >Meshy API documentation ↗</a
+          >
+        </div>
+      </section>
+      <p class="footnote">
+        A comparison of the configured pipelines, not an identical-input benchmark:
+        Punching Face uses many video frames; Meshy receives four. Display height is
+        normalized, not a measurement of anatomical accuracy. Shape and Wireframe hide
+        separate hair fibers and glasses on Punching Face to expose its base surface;
+        Meshy’s integrated geometry remains visible.
+      </p>
+      <p id="error" role="alert"></p>
+    </main>
+    <dialog id="photo-dialog">
+      <button id="close-photo">Close photo</button
+      ><img id="large-photo" alt="Source image sent to Meshy" />
+    </dialog>
+    <script type="module" src="/src/engine-comparison.js"></script>
+  </body>
+</html>

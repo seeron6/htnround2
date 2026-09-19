@@ -5,13 +5,23 @@ import cv2
 import numpy as np
 from PIL import Image
 from face_pipeline import atomic
+from scripts.detail_color import fuse_native_detail
+
+# Existing captures retain their inputs until an explicit, verified migration.
+# RGB hashes bind generated cleanup and semantic caches to these exact images.
+DETAIL_CACHE_VERSIONS = (2, 3)
+DETAIL_VERSION = 3
+DETAIL_SOURCE = (
+    'Original video detail at matched timestamps; alpha-normalized colour match '
+    'to registered browser-decoded frames; original alpha; no super-resolution'
+)
 
 
 def prepare_detail_frames(folder):
     manifest = folder / 'photo-detail.json'
     if manifest.exists():
         cached = json.loads(manifest.read_text())
-        if cached.get('version') == 2:
+        if cached.get('version') in DETAIL_CACHE_VERSIONS:
             return cached
     video = folder / 'source-video'
     if not video.exists():
@@ -33,6 +43,8 @@ def prepare_detail_frames(folder):
             )
             h, w = captured.shape[:2]
             valid = captured[:, :, 3] > 220
+            if not valid.any():
+                continue
             best = None
             # Browser seeking and native decoders can round a timestamp to
             # adjacent frames. Match against the registered image before use.
@@ -59,29 +71,7 @@ def prepare_detail_frames(folder):
             # Phone HDR/colour metadata is handled differently by the browser
             # and OpenCV. Preserve the registered browser-decoded skin colour;
             # take only extra spatial detail from the native decoder.
-            registered = cv2.resize(
-                captured[:, :, :3],
-                (rgb.shape[1], rgb.shape[0]),
-                interpolation=cv2.INTER_CUBIC,
-            ).astype(np.float32)
-            native = rgb.astype(np.float32)
-            sigma = 1.4 * rgb.shape[1] / w
-            rgb = np.uint8(
-                np.clip(
-                    cv2.GaussianBlur(registered, (0, 0), sigma)
-                    + native
-                    - cv2.GaussianBlur(native, (0, 0), sigma),
-                    0,
-                    255,
-                )
-            )
-            alpha = cv2.resize(
-                captured[:, :, 3],
-                (rgb.shape[1], rgb.shape[0]),
-                interpolation=cv2.INTER_NEAREST,
-            )
-            rgba = np.dstack([rgb, alpha])
-            rgba[alpha == 0, :3] = 0
+            rgba, fusion = fuse_native_detail(captured, rgb)
             Image.fromarray(rgba).save(output / frame['filename'])
             audit.append(
                 {
@@ -91,16 +81,14 @@ def prepare_detail_frames(folder):
                     'matchError255': round(error, 3),
                     'size': [rgb.shape[1], rgb.shape[0]],
                     'registeredSize': [w, h],
+                    'colorFusion': fusion,
                 }
             )
     finally:
         decoder.release()
     result = {
-        'version': 2,
-        'source': (
-            'Original video detail at matched timestamps; colour matched to '
-            'registered browser-decoded frames; no super-resolution'
-        ),
+        'version': DETAIL_VERSION,
+        'source': DETAIL_SOURCE,
         'frames': audit,
     }
     atomic(manifest, result)

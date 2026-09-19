@@ -149,6 +149,57 @@ The bake now also snapshots supported part-0 prepared color before generic compl
 
 A stricter private ear-fill experiment evaluates conservative surface paths at individual texels and fades support over the final 4 mm of a 20 mm radius. Its protected-color invariant passes, but the rendered attachment remains visibly incomplete, so it is still not hooked into production. These development comparisons do not validate anatomy or generalization. Residual attachment seams and uncertain unobserved appearance remain open work; this release does not establish hyperrealistic results or generalization to arbitrary videos.
 
+### Native extraction edge color and matte validation
+
+Astra identified a source-detail bug independent of the remaining ear-attachment seam: resampling zero RGB outside the registered alpha and subtracting an unmasked native blur manufactured dark hair borders. The shared `detail_color.fuse_native_detail` now normalizes both registered resampling and smooth color correction by foreground support. New standard and accelerated extractions record version 3 with per-frame audits; accepted version-2 image caches remain unchanged because downstream generated cleanup and semantic caches bind their bytes. Empty foreground frames cannot pass a NaN match score. Downscaling has separate coverage: a vanished alpha hole cannot incorrectly qualify the old color calculation as safe, and area resampling retains sparse registered color support.
+
+There are 31 passing focused tests plus 13 accelerator tests, including complete byte-identical manifests and all 51 PNGs from the real recording. A private full-texture comparison preserves geometry, alpha, opaque source interiors and the production supported-color gate. It also exposes a dependency: re-registering the same generated glasses-cleanup photograph changes its alignment when the input RGB changes. That comparison must not be described as an isolated color-only test. The published input cache was not migrated. Full provenance and caveats are in [native-detail validation](docs/HEAD_NATIVE_DETAIL.md).
+
+A separate [native outer-matte experiment](docs/HEAD_MASK_EXPERIMENT.md#native-outer-matte-experiment) returns to the original video and plausibly restores three diagnosed wisps removed by the registered alpha. Fourteen proposals across seven views preserve known alpha but initially change some known-foreground colors by up to 47 channel levels. Private corrected proposals restore original RGB outside the uncertain band exactly. Matting remains disabled in production until temporal, color and uncertain-evidence handling are validated. Neither the new color-fusion path nor this experiment establishes realistic individual fibers, clean ear attachments, intrinsic skin color or generalization to arbitrary videos.
+
+### Ear occlusion and cleanup ownership
+
+A connected head-surface continuation now addresses the dark crescent left where source ears correctly occlude the surrounding head. Temporary categorical clipping reaches head-owned portions of mixed triangles without changing the model mesh or borrowing color through an ear. A second traced bug allowed source-ear inpainting to masquerade as verified glasses cleanup; RGB and ownership now share the same per-view exclusions, and valid cleanup suppresses later inferred hair. [Ear appearance validation](docs/HEAD_EAR_APPEARANCE.md) records the implementation and actual rendered comparisons. Small unsupported ear-owned attachment patches remain. Fresh-process tracing also captured sparse, large errors in the ear affine projection. Explicit row arithmetic now avoids that path, and independent serial/four-worker production bakes pass exact texture and metadata comparisons. The targeted suite passes 96 tests, with one optional test skipped; the real-capture check was run separately. Generation `8488bd76981e4320bcde74d59249456d` publishes the verified appearance, including the concurrently developed estimated crown material. Geometry, UV correspondence, groom, accessory geometry and rig files remain unchanged; all six served browser assets match the release manifest. Residual ear-owned flaps and estimated eyes remain visible.
+
+### Source-constrained ear outlines and stage snapshots
+
+Generation `3fd53b91e39344e8bf81aaacfb7b9162` reduces the remaining outer ear flaps using reliable visible source arcs, with fixed face/cage/ear anchors, bidirectional contour gates and independent pre-ear surface checks. The maximum change is 7.075 mm. Three approximate held-out arcs from the same recording improve in overall error; the right-side check covers only a short upper rim. Existing photographic hair bindings and colors are retained while 172 roots and 3,347 curve stations follow the edited surface. Attachment appearance seams and template inner folds remain.
+
+A later hair edit had made nonlinear ear replay drift by up to 2.419 mm. Separate hashed post-ear contour-stage snapshots now preserve the accepted input and prevent cumulative refinement. Full builds, detail rebuilds and hair-refit baseline updates share this stage contract. The old visibility-only material classifier now retains anatomical ear identity. The corrected detail rebuild reproduces the candidate's geometry and groom exactly; fresh-process serial/four-worker bakes match PNGs and atlas metadata, and all six served assets match the release. There are 124 passing targeted Python tests and 10 hair-renderer tests. A fresh live Newton session was not validated in this pass. Full evidence and limits are in [ear contour validation](docs/HEAD_EAR_CONTOURS.md). The broad hyperrealism goal remains unproven.
+
+### Unmasked source review and measured eyewear persistence
+
+The review now shows matched unmasked video frames by default, with an explicit
+cutout toggle. The old mask removed a real far lens, so absence in that cutout
+cannot serve as an accessory-visibility observation. Full builds and detail
+rebuilds now share the same measured eyewear fitter; a private complete rebuild
+preserves head/hair/skin/physics exactly while retaining 51 measured rim widths.
+Sampled renderer checks also reveal existing arm intersections, so the new
+glasses proposals remain private. Astra's exact atlas trace identifies false
+predicted-ear donors. An experimental bake hook now reduces their influence
+when two independent annotated views contradict them. Fresh serial/threaded
+bakes agree exactly, but the resulting darker estimate does not fix the visible
+attachment seam, so the hook stays off by default and is not published. See
+[source evidence and validation](docs/HEAD_SOURCE_OBSERVATIONS.md) and the
+[ear donor experiment](docs/HEAD_EAR_DONORS.md).
+
+### Continuous estimated head/ear attachment
+
+Astra's native-frame and exact-atlas checks identified a separate color-field
+discontinuity at the attachment: the head and ear fills assigned different
+estimated colors to adjacent points on the same facet. One continuous local
+surface field now joins unsupported attachment samples while preserving the
+measured face, reliable skin/hair, cleanup, eyes, mouth and cap. Excluded eye/cap
+faces cannot supply anchors through shared vertices.
+
+The corrected implementation passes 44 focused tests and fresh serial/threaded
+bakes with exact PNG/atlas agreement. Browser and independent matched-angle
+comparisons show cleaner upper attachments and lower lobes. Generation
+`41fa09628c104090af7ffb8253fbce56` is the accepted local texture-only update;
+geometry, accessories and rig remain exact. The inferred tones, template inner
+ears and other capture/appearance limitations remain. See
+[attachment evidence and release checks](docs/HEAD_ATTACHMENT_CONTINUATION.md).
+
 ## Local use
 
 ```sh
@@ -163,7 +214,7 @@ Serial/threaded texture equivalence can be checked without publishing or changin
 PYTHONPATH=. .venv/bin/python scripts/verify_texture_bake.py .local/face-captures/CAPTURE_ID --report .local/texture-verification.json
 ```
 
-This runs one-worker and four-worker bakes against cached inputs, compares exact PNG bytes and atlas metadata, rejects source writes/network access, and checks that the relevant code did not change during the run.
+This runs one-worker and four-worker bakes in separate fresh Python interpreters against cached inputs, compares exact PNG bytes and atlas metadata, rejects source writes/network access in each worker, and checks that the relevant code did not change during the run. Fresh processes prevent shared in-memory state from concealing repeatability defects.
 
 Accepted model artifacts are resolved with `head_artifacts.published_folder(capture)`. New releases live under `CAPTURE/.model-generations/`; `model-release.json` identifies the current bundle. Root images and AI caches remain reusable inputs. Legacy root model files are retained for old sessions and are not the latest model after a new release. Use the current build/refinement commands above; the old Gaussian/legacy surface writers refuse to overwrite a generation-based capture.
 

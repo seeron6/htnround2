@@ -20,7 +20,13 @@ from scripts.photo_geometry import (
     eye_parts,
 )
 from scripts.astra_head_completion import complete, apply_shape_prior
-from scripts.head_accessories import build_glasses, sample_frame_colors
+from scripts.fitted_eyewear import fit_photo_glasses
+from scripts.eyewear_separation import (
+    detect_eyewear,
+    require_separate_glasses,
+    require_glasses_cleanup,
+    EyewearSeparationError,
+)
 from scripts.hair_groom import build_hair_groom
 from scripts.hair_recognition import recognize_hair, hair_completion
 from scripts.photo_hair import fit_template_hair
@@ -258,6 +264,12 @@ def _run(folder, use_astra, publication):
                 'unobservedParts': advice['unobservedParts'],
                 'completionVersion': advice['version'],
             }
+        eyewear_detection = detect_eyewear(advice)
+        evidence['eyewearDetection'] = eyewear_detection
+        if advice and eyewear_detection['state'] == 'unknown':
+            raise EyewearSeparationError(
+                'Eyewear detection is uncertain. Capture sharper front and side views so accessories can be separated.'
+            )
         status(
             'eyes',
             (
@@ -309,8 +321,12 @@ def _run(folder, use_astra, publication):
                     evidence['glassesCleanup'] = {
                         'available': False,
                         'reason': str(error),
-                        'fallback': 'Local opaque-frame cleanup; lens appearance remains captured.',
                     }
+                require_glasses_cleanup(
+                    eyewear_detection,
+                    evidence['glassesCleanup'],
+                    advice['frontFilename'],
+                )
             measurements = triangulate_ears(
                 folder, rec, center, B, transform, semantics
             )
@@ -334,6 +350,7 @@ def _run(folder, use_astra, publication):
                 B,
                 transform,
                 template_info['earRegions'],
+                output_folder=output,
             )
             evidence['hair'] = hair
         if advice:
@@ -347,17 +364,6 @@ def _run(folder, use_astra, publication):
             # shape changes must not invalidate the ear quality checks.
             p, evidence['earFit'] = fit_ears(
                 p, f, face_count, template_info['earRegions'], measurements
-            )
-            evidence['earOwnership'] = refine_ear_ownership(
-                folder,
-                p,
-                f,
-                template_info['earRegions'],
-                semantics,
-                rec,
-                center,
-                B,
-                transform,
             )
         if hair_base is not None:
             from scripts.hair_transition import continue_hair_transition
@@ -375,6 +381,18 @@ def _run(folder, use_astra, publication):
             moved = np.any(revised != p, axis=1)
             pre_ear_surface[moved] += revised[moved] - p[moved]
             p = revised
+        contour_rest = p.astype(np.float32).copy()
+        if semantics:
+            from scripts.ear_contour_pipeline import refine_capture_ear_contours
+
+            p, evidence['earContourFit'] = refine_capture_ear_contours(
+                folder, p, f, face_count, template_info['earRegions'], semantics,
+                rec, center, B, transform, baseline=pre_ear_surface,
+            )
+            evidence['earOwnership'] = refine_ear_ownership(
+                folder, p, f, template_info['earRegions'], semantics, rec,
+                center, B, transform,
+            )
         # Validate the final rendered skin after all shape stages. The earlier
         # triangulation gate alone cannot detect template fitting drift.
         surface_test = surface_projection_error(
@@ -401,18 +419,10 @@ def _run(folder, use_astra, publication):
                 )
             )
         status('accessories', 'Fitting separate glasses and hair detail…')
-        glasses = (
-            build_glasses(p, advice, rec, frames, center, B, transform)
-            if advice
-            else None
+        glasses = fit_photo_glasses(
+            folder, p, advice, rec, frames, center, B, transform
         )
-        if glasses:
-            frame_color = sample_frame_colors(folder, advice)
-            if frame_color:
-                glasses.update(
-                    frameColor=frame_color,
-                    colorSource='Opaque photo frame samples; never part of the skin atlas',
-                )
+        require_separate_glasses(eyewear_detection, glasses)
         evidence['accessories'] = {
             'glasses': bool(glasses),
             'source': (
@@ -558,6 +568,8 @@ def _run(folder, use_astra, publication):
         # Retain the exact surface before ear fitting for deterministic future
         # detail rebuilds, including after template selection changes topology.
         baseline = output / '.pending-pre-ear-surface.npz'
+        from scripts.ear_contour_rest import contour_rest_fields
+
         np.savez_compressed(
             baseline,
             positions=pre_ear_surface,
@@ -566,6 +578,7 @@ def _run(folder, use_astra, publication):
                 (folder / 'capture.json').read_bytes()
             ).hexdigest(),
             regularization=template_info['regularization'],
+            **(contour_rest_fields(contour_rest, f, measurements) if semantics else {}),
         )
         baseline.replace(output / 'pre-ear-surface.npz')
         atomic(output / 'mesh.json', data)

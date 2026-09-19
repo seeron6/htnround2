@@ -32,6 +32,9 @@ export default defineConfig({
     host: '127.0.0.1',
     port: Number(process.env.CONTACT_WEB_PORT || 5173),
     strictPort: true,
+    // Reloads destroy the in-memory video decoder and capture worker. Keep the
+    // lab stable while other work edits source files; developers can opt in.
+    hmr: process.env.CONTACT_HMR === '1',
     fs: {
       deny: [
         '.env',

@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import cv2, numpy as np, pycolmap
 from PIL import Image
 from head_artifacts import published_folder
+from scripts.source_observations import matched_video_observation
 
 
 def prepare(folder):
@@ -71,12 +72,29 @@ def prepare(folder):
         )
         box = Image.fromarray(rectified[:, :, 3]).getbbox()
         left, top, right_edge, bottom = box
-        pad = 20
+        # Segmentation may omit glasses extending beyond the face. Preserve
+        # extra image context rather than cropping those real accessories out.
+        pad = max(20, int(round((right_edge - left) * 0.08)))
         left = max(0, left - pad)
         top = max(0, top - pad)
         right_edge = min(w, right_edge + pad)
         bottom = min(h, bottom + pad)
         Image.fromarray(rectified[top:bottom, left:right_edge]).save(out / im.name)
+        source_rgb, source_audit = matched_video_observation(folder, im.name)
+        source_photo = None
+        if source_rgb is not None:
+            if source_rgb.shape[:2] != original.shape[:2]:
+                raise ValueError('Review and source-observation dimensions differ.')
+            source_rectified = cv2.remap(
+                source_rgb,
+                uv[:, :, 0].astype(np.float32),
+                uv[:, :, 1].astype(np.float32),
+                cv2.INTER_LINEAR,
+            )
+            source_photo = 'source-' + im.name
+            Image.fromarray(source_rectified[top:bottom, left:right_edge]).save(
+                out / source_photo
+            )
         matrix = np.eye(4)
         flip = np.diag([1, -1, -1])
         matrix[:3, :3] = flip @ pose.rotation.matrix() @ B.T
@@ -99,6 +117,8 @@ def prepare(folder):
                 'cy': cy - top,
                 'viewMatrix': matrix.ravel().tolist(),
                 'photo': im.name,
+                'sourcePhoto': source_photo,
+                'sourceObservation': source_audit,
             }
         )
     for name in [

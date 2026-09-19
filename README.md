@@ -8,6 +8,11 @@ The OMNI engine (Realtime WebSocket → Qwen3.5-Omni) is described under [OMNI i
 
 Run `npm run dev`, then open http://127.0.0.1:5173/. Vite runs on 5173, the capture/reconstruction API on 5174, the Newton CPU service on 5175, the OMNI relay on 5177. All bind to loopback. The Cornerman/Arena coach panel additionally needs `npm run sponsors` (5176) in a second terminal; without it the panel reports that sponsor services are off and the rest of the app is unaffected.
 
+Automatic page reloads are off by default so source edits cannot interrupt a
+video upload or recording. Refresh manually after frontend changes. For UI-only
+development, `CONTACT_HMR=1 npm run dev` enables hot reload; avoid that mode during
+captures. Restart `npm run dev` after Python API changes.
+
 ## Code formatting
 
 JavaScript, CSS and HTML use Prettier; Python uses Black. Both wrap code at 88
@@ -54,7 +59,11 @@ The scan dialog has a **Reconstruction engine** choice. It applies to the saved 
 
 Meshy needs an API key from the account's console (meshy.ai, Settings, API). Put `MESHY_API_KEY=msy_...` in `.env` and restart `npm run dev`, or paste it under **Meshy API settings** in the scan dialog, which stores it in `.local/secrets/meshy.json` with owner-only permissions. The key never reaches the browser. **Test connection** shows the credit balance. A textured build costs about 30 credits (the finished task reports the real figure) and takes one to three minutes. Nothing is sent until **Create 3D face with Meshy** is pressed; a finished model is reused, and rebuilding asks first. If the server restarts or a download fails mid-task, pressing Create again follows the same Meshy task instead of paying for a new one. `MESHY_AI_MODEL`, `MESHY_TARGET_POLYCOUNT` and `MESHY_ENABLE_PBR=1` override the defaults (`latest`, 30000 triangles, no PBR maps). The header's **Photo → 3D self** checkbox is the older single-webcam-photo Meshy path; it uses the same key and does not save its result.
 
-`.venv/bin/python tests/meshy_backend_test.py` covers view choice, cutouts and the task lifecycle against a local stand-in for the API. The real API has only been exercised up to authentication: Meshy's documented test-mode key is no longer accepted, so a first real build is the remaining check.
+`.venv/bin/python tests/meshy_backend_test.py` covers view choice, cutouts and the task lifecycle against a local stand-in for the API. A real multi-image build was completed on 2026-09-19 using four views from `IMG_7496.MOV`: 203.1 seconds, 30 credits, 30,559 triangles and a 2048px texture. The downloaded GLB is saved beside capture `7a2bc070892642999d3357c2c5838390` under `meshy/`.
+
+Open [the engine comparison](http://localhost:5173/engine-comparison.html) while the development server is running to inspect that Meshy result beside a snapshot of the published Punching Face head. Camera rotation and zoom are synchronized; Texture, Shape and Wireframe expose appearance and geometry separately. The page includes the four actual Meshy inputs and both pipeline descriptions. Its local, ignored assets are under `public/generated/engine-comparison/`. This compares the configured pipelines on the same video, with four Meshy inputs versus 40 recovered cameras for Punching Face; it is not an equal-input benchmark. The comparison page is a static inspection, without punch physics.
+
+The experimental [native TRELLIS face adaptation](docs/TRELLIS_FACE.md) extends pretrained geometry generation with multiple head views and measured-landmark fitting. It is not yet connected to the production builder or validated against Meshy.
 
 ## Newton contact and facial rig
 
@@ -74,6 +83,7 @@ Python runs in separate virtual environments, each with its own requirements fil
 | --- | --- | --- | --- |
 | `.venv` | 3.9–3.11 (3.9.6 here) | `requirements.txt` | capture/reconstruction API, photo pipeline, OMNI relay, sponsor server, most Python tests |
 | `.local/newton-env` | 3.10+ (3.13 here) | `requirements-newton.txt` | `physics_server.py`, `newton_face.py`, `tests/newton_test.py`, `tests/physics_sessions_test.py` |
+| `.local/trellis-env` | 3.13 | `requirements-trellis.txt` | optional native TRELLIS face adaptation experiment; [status and commands](docs/TRELLIS_FACE.md) |
 | `.local/format-env` | 3.10+ (3.13 here) | `requirements-dev.txt` | Black only, optional: see [Code formatting](#code-formatting) |
 | the first two | as above | `requirements-sponsors.txt` | optional Sentry SDK: see [SPONSOR_SETUP.md](SPONSOR_SETUP.md) |
 

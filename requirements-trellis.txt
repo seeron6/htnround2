@@ -1,0 +1,20 @@
+# env: .local/trellis-env
+# python: >=3.13,<3.14
+# optional: yes
+# Geometry-only Apple MLX experiment; does not require CUDA or compiled Metal extensions.
+torch==2.14.0
+torchvision==0.29.0
+mlx==0.32.2
+mlx-metal==0.32.2
+transformers==5.17.0
+safetensors==0.8.0
+huggingface_hub==1.32.0
+pillow==12.3.0
+numpy==2.5.3
+scipy==1.18.1
+trimesh==5.1.0
+xatlas==0.0.11
+opencv-python-headless==5.0.0.93
+easydict==1.13
+tqdm==4.70.1
+einops==0.8.2

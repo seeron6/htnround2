@@ -103,6 +103,96 @@ class HairBaselineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'current facial surface'):
             update_refit_baseline(self.stage, self.before, self.before)
 
+    def add_contour_snapshot(self):
+        from scripts.ear_contour_rest import contour_rest_fields
+
+        self.measurements = {
+            '1': {'landmarks': {'top': [0.04, 0.05, 0.06]}, 'views': 2}
+        }
+        self.contour_rest = self.old.copy()
+        self.contour_rest[469, 2] -= 0.002  # Separate post-ear/pre-contour stage.
+        path = self.stage / 'pre-ear-surface.npz'
+        with np.load(path, allow_pickle=False) as saved:
+            payload = {key: saved[key].copy() for key in saved.files}
+        self.contour_fields = contour_rest_fields(
+            self.contour_rest, self.faces, self.measurements
+        )
+        np.savez_compressed(path, **payload, **self.contour_fields)
+        (self.stage / 'ear-measurements.json').write_text(json.dumps(self.measurements))
+
+    def test_refit_transports_both_independent_stage_inputs_with_unchanged_measurement_digest(
+        self,
+    ):
+        from scripts.ear_contour_rest import load_contour_rest
+
+        self.add_contour_snapshot()
+        new = self.old.copy()
+        new[468] += [0.007, -0.009, 0.011]
+        update_refit_baseline(self.stage, self.before, self.after(new))
+        delta = new.astype(float) - self.old.astype(float)
+        with np.load(self.stage / 'pre-ear-surface.npz', allow_pickle=False) as saved:
+            np.testing.assert_array_equal(saved['positions'], self.rest + delta)
+            expected = (self.contour_rest.astype(float) + delta).astype(np.float32)
+            loaded = load_contour_rest(saved, new, self.faces, 1, self.measurements)
+            np.testing.assert_array_equal(loaded, expected)
+            np.testing.assert_array_equal(
+                loaded[[469, 470]], self.contour_rest[[469, 470]]
+            )
+            np.testing.assert_array_equal(loaded[:468], self.old[:468])
+            self.assertEqual(
+                str(saved['contourRestMeasurementsSha256']),
+                self.contour_fields['contourRestMeasurementsSha256'],
+            )
+            self.assertEqual(
+                str(saved['contourRestTopologySha256']),
+                self.contour_fields['contourRestTopologySha256'],
+            )
+            self.assertNotEqual(
+                str(saved['contourRestPositionsSha256']),
+                self.contour_fields['contourRestPositionsSha256'],
+            )
+            self.assertEqual(str(saved['captureHash']), 'original-capture')
+            np.testing.assert_array_equal(saved['extraMetadata'], [3, 7])
+        previous = (self.stage / 'pre-ear-surface.npz').read_bytes()
+        update_refit_baseline(self.stage, self.after(new), self.after(new))
+        self.assertEqual((self.stage / 'pre-ear-surface.npz').read_bytes(), previous)
+
+    def test_contour_transport_rejects_missing_or_changed_measurements_without_writing(
+        self,
+    ):
+        self.add_contour_snapshot()
+        baseline = self.stage / 'pre-ear-surface.npz'
+        original = baseline.read_bytes()
+        path = self.stage / 'ear-measurements.json'
+        new = self.old.copy()
+        new[468, 0] += 0.001
+        path.unlink()
+        with self.assertRaisesRegex(ValueError, 'measurements'):
+            update_refit_baseline(self.stage, self.before, self.after(new))
+        self.assertEqual(baseline.read_bytes(), original)
+        changed = {'1': {'landmarks': {'top': [0.041, 0.05, 0.06]}, 'views': 2}}
+        path.write_text(json.dumps(changed))
+        with self.assertRaisesRegex(ValueError, 'observations changed'):
+            update_refit_baseline(self.stage, self.before, self.after(new))
+        self.assertEqual(baseline.read_bytes(), original)
+
+    def test_partial_contour_snapshot_is_not_silently_left_on_old_surface(self):
+        self.add_contour_snapshot()
+        path = self.stage / 'pre-ear-surface.npz'
+        with np.load(path, allow_pickle=False) as saved:
+            payload = {
+                key: saved[key].copy()
+                for key in saved.files
+                if key != 'contourRestPositions'
+            }
+        np.savez_compressed(path, **payload)
+        original = path.read_bytes()
+        new = self.old.copy()
+        new[468, 0] += 0.001
+        with self.assertRaisesRegex(ValueError, 'Incomplete'):
+            update_refit_baseline(self.stage, self.before, self.after(new))
+        self.assertEqual(path.read_bytes(), original)
+
 
 if __name__ == '__main__':
     unittest.main()

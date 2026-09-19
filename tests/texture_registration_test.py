@@ -37,6 +37,33 @@ class VisibilityTests(unittest.TestCase):
 
 
 class RegistrationTests(unittest.TestCase):
+    def test_affine_registration_preserves_subsets_across_concurrent_views(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from scripts.ear_fit import affine_sample_coordinates
+
+        # Rotated, translated and sheared image coordinates, including the
+        # non-contiguous matrix layout returned to the old Nx2 product.
+        rng = np.random.default_rng(714)
+        xy = rng.uniform([-40, -20], [580, 980], (65539, 2))
+        matrices = rng.normal(size=(4, 2, 3))
+        saved = xy.copy()
+        ids = rng.permutation(len(xy))[:17003]
+        serial = [affine_sample_coordinates(xy, matrix) for matrix in matrices]
+        with ThreadPoolExecutor(4) as pool:
+            concurrent = list(
+                pool.map(lambda matrix: affine_sample_coordinates(xy, matrix), matrices)
+            )
+        for matrix, full, actual in zip(matrices, serial, concurrent):
+            np.testing.assert_array_equal(actual, full)
+            np.testing.assert_array_equal(
+                affine_sample_coordinates(xy[ids], matrix), full[ids]
+            )
+            np.testing.assert_allclose(
+                full, xy @ matrix[:, :2].T + matrix[:, 2], atol=1e-12
+            )
+        np.testing.assert_array_equal(xy, saved)
+        self.assertEqual(affine_sample_coordinates(xy[:0], matrices[0]).shape, (0, 2))
+
     def test_photo_warp_is_continuous_into_scalp_and_pins_measured_face(self):
         from scripts.ear_fit import ear_sample_coordinates
 

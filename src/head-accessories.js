@@ -7,6 +7,65 @@ const curve = (points) =>
     'centripetal',
   );
 
+// Profile detections can wobble at the ear. Keep the visible temple as a
+// straight rigid shaft, then reserve only the final section for the downward
+// hook. The lateral shoulder is deliberately bounded so the arm stays tucked
+// behind the front silhouette instead of flaring into a side spike.
+function templeCurve(points) {
+  const start = new THREE.Vector3(...points[0]),
+    end = new THREE.Vector3(...points.at(-1)),
+    span = start.z - end.z;
+  if (points.length < 3 || span < 0.04) return new THREE.LineCurve3(start, end);
+  const hookStart = 0.78,
+    sign = Math.sign(start.x) || 1,
+    shoulder = start.clone().lerp(end, hookStart),
+    rawLateral = sign * (shoulder.x - start.x),
+    lateral = Math.min(Math.max(0, rawLateral), 0.022);
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1],
+      b = points[i];
+    if (a[2] >= shoulder.z && b[2] <= shoulder.z && a[2] > b[2]) {
+      shoulder.y = THREE.MathUtils.lerp(
+        a[1],
+        b[1],
+        (a[2] - shoulder.z) / (a[2] - b[2]),
+      );
+      break;
+    }
+  }
+  // Preserve the measured vertical slope at the shoulder while suppressing
+  // noisy lateral excursions that become visible in the frontal render.
+  shoulder.x = start.x + sign * lateral;
+  const path = new THREE.CurvePath(),
+    direction = shoulder.clone().sub(start).normalize(),
+    hookLength = shoulder.distanceTo(end);
+  path.add(new THREE.LineCurve3(start, shoulder));
+  path.add(
+    new THREE.CubicBezierCurve3(
+      shoulder,
+      shoulder.clone().addScaledVector(direction, hookLength * 0.35),
+      end.clone().lerp(shoulder, 0.25),
+      end,
+    ),
+  );
+  return path;
+}
+
+// Surface-fitted paths already encode the shaft and ear bend. Preserve those
+// segments: straightening or spline overshoot can put a cleared arm back inside
+// the head. Older specifications retain their original rendering path.
+function fittedTempleCurve(points) {
+  const path = new THREE.CurvePath();
+  for (let i = 1; i < points.length; i++) {
+    const a = new THREE.Vector3(...points[i - 1]),
+      b = new THREE.Vector3(...points[i]);
+    if (a.distanceToSquared(b) < 1e-14)
+      throw new Error('Invalid fitted eyeglass arm segment.');
+    path.add(new THREE.LineCurve3(a, b));
+  }
+  return path;
+}
+
 // A small studio reflection field gives polished acetate and lens surfaces
 // broad highlights in viewers that have no room environment. Skin is untouched.
 function eyewearEnvironment() {
@@ -43,7 +102,10 @@ function eyewearEnvironment() {
 function sweep(path, closed, section, segments = 96) {
   const positions = [],
     indices = [],
-    sides = 16;
+    // Acetate has a broad, almost planar face with a small rounded bevel.
+    // More section samples keep that bevel smooth without turning the frame
+    // into a thin circular wire.
+    sides = 20;
   for (let i = 0; i <= segments; i++) {
     const t = i / segments,
       p = path.getPoint(t),
@@ -58,8 +120,8 @@ function sweep(path, closed, section, segments = 96) {
       positions.push(
         ...p
           .clone()
-          .addScaledVector(u, (Math.sign(c) * Math.pow(Math.abs(c), 0.45) * width) / 2)
-          .addScaledVector(v, (Math.sign(s) * Math.pow(Math.abs(s), 0.45) * depth) / 2)
+          .addScaledVector(u, (Math.sign(c) * Math.pow(Math.abs(c), 0.32) * width) / 2)
+          .addScaledVector(v, (Math.sign(s) * Math.pow(Math.abs(s), 0.32) * depth) / 2)
           .toArray(),
       );
     }
@@ -145,6 +207,30 @@ export class HeadGlasses extends THREE.Group {
       )
     )
       throw new Error('Invalid reconstructed glasses paths.');
+    if (
+      spec.rimWidths &&
+      (spec.rimWidths.length !== 2 ||
+        spec.rimWidths.some(
+          (widths, i) =>
+            !Array.isArray(widths) ||
+            widths.length !== spec.rims[i].length ||
+            widths.some((w) => !Number.isFinite(w) || w <= 0 || w > 0.01),
+        ))
+    )
+      throw new Error('Invalid measured eyeglass rim widths.');
+    if (spec.templePathMode !== undefined && spec.templePathMode !== 'fitted-polyline')
+      throw new Error('Invalid fitted eyeglass arm mode.');
+    const dimensions = [
+      spec.rimDepth,
+      spec.bridgeWidth,
+      spec.bridgeDepth,
+      spec.lensThickness,
+      spec.templeAccent?.length,
+      spec.templeAccent?.width,
+      spec.templeAccent?.offset,
+    ].filter((v) => v !== undefined);
+    if (dimensions.some((v) => !Number.isFinite(v) || v <= 0 || v > 0.03))
+      throw new Error('Invalid eyeglass detail dimensions.');
     const color = new THREE.Color().setRGB(
       ...(spec.frameColor ?? [0.04, 0.04, 0.04]),
       THREE.SRGBColorSpace,
@@ -152,34 +238,44 @@ export class HeadGlasses extends THREE.Group {
     this.reflection = eyewearEnvironment();
     const material = new THREE.MeshPhysicalMaterial({
       color,
-      roughness: 0.21,
+      roughness: 0.18,
       metalness: 0,
+      // Dark acetate still produces a broad warm grazing highlight. Keep this
+      // lobe separate from the clearcoat so the frames read as solid plastic
+      // at three-quarter and profile angles instead of flat black ink.
+      specularIntensity: 0.82,
+      specularColor: new THREE.Color(0.28, 0.24, 0.21),
       clearcoat: 1,
-      clearcoatRoughness: 0.11,
+      clearcoatRoughness: 0.085,
       envMap: this.reflection,
-      envMapIntensity: 0.7,
+      envMapIntensity: 1.05,
     });
     const tint = THREE.MathUtils.clamp(spec.lensTint ?? 0, 0, 0.6);
     // Preserve the measured eyes: screen-space refraction bends the already
     // photographed lens distortion a second time and pulls in the backdrop.
     const lensMaterial = new THREE.MeshPhysicalMaterial({
       color: new THREE.Color().setRGB(1 - tint * 0.25, 1 - tint * 0.22, 1 - tint * 0.2),
-      roughness: 0.035,
+      roughness: 0.045,
       metalness: 0,
       ior: 1.5,
       transparent: true,
-      opacity: 0.055 + tint * 0.1,
+      // A real clear lens needs a restrained optical response to catch the
+      // studio light, while remaining transparent enough to preserve the
+      // photographed eyes and brows behind it.
+      opacity: 0.11 + tint * 0.08,
       depthWrite: false,
       side: THREE.DoubleSide,
-      clearcoat: 1,
-      clearcoatRoughness: 0.06,
+      specularIntensity: 0.56,
+      specularColor: new THREE.Color(0.78, 0.84, 0.82),
+      clearcoat: 0.7,
+      clearcoatRoughness: 0.045,
       envMap: this.reflection,
-      envMapIntensity: 0.6,
+      envMapIntensity: 1.1,
     });
     const metal = new THREE.MeshStandardMaterial({
-      color: 0x959995,
-      roughness: 0.24,
-      metalness: 0.8,
+      color: 0xb9bdbb,
+      roughness: 0.32,
+      metalness: 0.65,
       envMap: this.reflection,
     });
     const radius = THREE.MathUtils.clamp(spec.radius ?? 0.0015, 0.0008, 0.003);
@@ -196,14 +292,28 @@ export class HeadGlasses extends THREE.Group {
       const ys = points.map((p) => p[1]),
         bottom = Math.min(...ys),
         height = Math.max(...ys) - bottom;
+      const measuredWidths = spec.rimWidths?.[i];
+      const rimWidth = (t, p) => {
+        if (!measuredWidths?.length)
+          return radius * (1.25 + (0.75 * (p.y - bottom)) / Math.max(0.001, height));
+        const index = (t % 1) * measuredWidths.length;
+        const a = Math.floor(index),
+          f = index - a;
+        return THREE.MathUtils.clamp(
+          measuredWidths[a] * (1 - f) +
+            measuredWidths[(a + 1) % measuredWidths.length] * f,
+          0.001,
+          0.0068,
+        );
+      };
       add(
         sweep(
           path,
           true,
-          (_, p, t) => ({
-            axis: new THREE.Vector3(-t.y, t.x, 0),
-            width: radius * (1.25 + (0.75 * (p.y - bottom)) / Math.max(0.001, height)),
-            depth: radius * 1.65,
+          (t, p, tangent) => ({
+            axis: new THREE.Vector3(-tangent.y, tangent.x, 0),
+            width: rimWidth(t, p),
+            depth: spec.rimDepth ?? radius * 1.65,
           }),
           128,
         ),
@@ -216,6 +326,39 @@ export class HeadGlasses extends THREE.Group {
         `Eyeglass lens ${i + 1}`,
       );
       lens.renderOrder = 2;
+      if (spec.lensThickness) {
+        const center = points
+          .reduce((p, q) => p.add(new THREE.Vector3(...q)), new THREE.Vector3())
+          .divideScalar(points.length);
+        const edge = curve(
+          points.map((q, j) => {
+            const p = new THREE.Vector3(...q),
+              d = p.clone().sub(center);
+            const inset = rimWidth(j / points.length, p) * 0.48;
+            p.addScaledVector(d, -inset / Math.max(0.001, Math.hypot(d.x, d.y)));
+            return p.toArray();
+          }),
+        );
+        edge.closed = true;
+        const edgeMaterial = lensMaterial.clone();
+        edgeMaterial.opacity = 0.26;
+        edgeMaterial.color.setRGB(0.82, 0.9, 0.88);
+        const edgeMesh = add(
+          sweep(
+            edge,
+            true,
+            (_, p, tangent) => ({
+              axis: new THREE.Vector3(-tangent.y, tangent.x, 0),
+              width: 0.0003,
+              depth: THREE.MathUtils.clamp(spec.lensThickness, 0.0006, 0.002),
+            }),
+            128,
+          ),
+          edgeMaterial,
+          `Eyeglass polished lens edge ${i + 1}`,
+        );
+        edgeMesh.renderOrder = 2;
+      }
     });
     add(
       sweep(
@@ -223,8 +366,8 @@ export class HeadGlasses extends THREE.Group {
         false,
         () => ({
           axis: new THREE.Vector3(0, 1, 0),
-          width: radius * 1.8,
-          depth: radius * 1.7,
+          width: spec.bridgeWidth ?? radius * 1.8,
+          depth: spec.bridgeDepth ?? radius * 1.7,
         }),
         48,
       ),
@@ -232,13 +375,20 @@ export class HeadGlasses extends THREE.Group {
       'Eyeglass bridge',
     );
     spec.temples.forEach((points, i) => {
-      const path = curve(points),
-        width = THREE.MathUtils.clamp(spec.templeWidth ?? 0.005, 0.002, 0.007);
+      const path =
+          spec.templePathMode === 'fitted-polyline'
+            ? fittedTempleCurve(points)
+            : templeCurve(points),
+        // Restore the broad acetate section after head-height normalization.
+        width = THREE.MathUtils.clamp((spec.templeWidth ?? 0.005) * 1.4, 0.0024, 0.008);
       add(
         sweep(path, false, (t) => ({
           axis: new THREE.Vector3(0, 1, 0),
           width: width * (1 - 0.52 * THREE.MathUtils.smoothstep(t, 0.08, 0.95)),
-          depth: 0.0022 * (1 - 0.25 * t),
+          // The source shows broad acetate arms rather than wire temples. Keep
+          // the measured shaft path, while giving the side panel enough depth
+          // to produce a real edge highlight in profile views.
+          depth: 0.0031 * (1 - 0.25 * t),
         })),
         material,
         `Eyeglass temple ${i + 1}`,
@@ -256,6 +406,50 @@ export class HeadGlasses extends THREE.Group {
       plate.position.copy(p);
       plate.position.x += sign * 0.00125;
       plate.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), tangent);
+      if (spec.templeAccent) {
+        const detail = spec.templeAccent,
+          length = path.getLength();
+        const start = THREE.MathUtils.clamp((detail.offset ?? 0.004) / length, 0, 0.3);
+        const end = Math.min(
+          0.6,
+          start + THREE.MathUtils.clamp(detail.length, 0.004, 0.02) / length,
+        );
+        const accentPoints = Array.from({ length: 9 }, (_, j) => {
+          const t = start + ((end - start) * j) / 8;
+          const q = path.getPointAt(t),
+            tangent = path.getTangentAt(t);
+          const outward = new THREE.Vector3(-tangent.z, 0, tangent.x)
+            .normalize()
+            .multiplyScalar(sign);
+          q.addScaledVector(outward, 0.0013);
+          q.y += width * 0.16;
+          return q.toArray();
+        });
+        add(
+          sweep(
+            curve(accentPoints),
+            false,
+            () => ({
+              axis: new THREE.Vector3(0, 1, 0),
+              width: THREE.MathUtils.clamp(detail.width, 0.0006, 0.0018),
+              depth: 0.00028,
+            }),
+            32,
+          ),
+          metal,
+          `Eyeglass inset temple accent ${i + 1}`,
+        );
+        for (const [j, point] of [accentPoints[0], accentPoints[8]].entries()) {
+          const screw = add(
+            new THREE.CylinderGeometry(0.00045, 0.00045, 0.00022, 16),
+            metal,
+            `Eyeglass hinge screw ${i + 1}.${j + 1}`,
+          );
+          screw.rotation.z = Math.PI / 2;
+          screw.position.set(...point);
+          screw.position.x += sign * 0.00016;
+        }
+      }
     });
   }
 

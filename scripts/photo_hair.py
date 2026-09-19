@@ -178,6 +178,8 @@ def fit_template_hair(
     B,
     transform,
     ear_regions=None,
+    *,
+    output_folder=None,
 ):
     """Fit the photographed asymmetric envelope without smoothing away locks."""
     from scipy.sparse import csr_matrix
@@ -216,7 +218,10 @@ def fit_template_hair(
     from scripts.frame_evidence import assess_frames, choose_views
 
     selected = choose_views(
-        views, frames, np.arange(-180, 180, 30), assess_frames(folder)
+        views,
+        frames,
+        np.arange(-180, 180, 30),
+        assess_frames(folder, output_folder=output_folder),
     )
     ray = p[ids] - origin
     samples = np.linspace(0.45, 1.48, 181)

@@ -371,6 +371,35 @@ def surface_coverage(alpha, facing, usable, side_support):
     return alpha * confidence * confidence * (3 - 2 * confidence) * side_support
 
 
+def cleanup_weights(
+    alpha, quality, preference, facing, usable, side_support, opaque_alpha, excluded
+):
+    """Return reference RGB weight and ownership with identical exclusions.
+
+    A photographed source ear can be inpainted before RGB sampling. That
+    estimate must never count as a verified glasses edit, even with a fully
+    opaque reference mask or the relaxed oblique temple-arm ownership rule.
+    Apply exclusions per view so a different unobstructed reference can win.
+    """
+    allowed = ~np.asarray(excluded, dtype=bool)
+    strength = quality * preference * alpha * allowed
+    confidence = np.clip(quality * preference / 0.02, 0, 1)
+    confidence = confidence * confidence * (3 - 2 * confidence)
+    coverage = (
+        np.maximum(
+            alpha * confidence,
+            surface_coverage(alpha, facing, usable, side_support) * opaque_alpha,
+        )
+        * allowed
+    )
+    return strength, coverage
+
+
+def supported_cleanup_coverage(coverage, total):
+    """Only aggregate reference RGB actually used by the bake owns appearance."""
+    return np.where(np.asarray(total) > 1e-7, coverage, 0.0)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('folder', type=Path)

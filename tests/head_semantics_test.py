@@ -147,23 +147,29 @@ class EarTests(unittest.TestCase):
             Image.fromarray(np.full((400, 200, 4), 255, np.uint8)).save(
                 folder / 'images/view.png'
             )
-            with (
-                patch('scripts.frame_evidence.assess_frames', return_value={}),
-                patch('scripts.frame_evidence.choose_views', return_value={'view.png'}),
-            ):
-                out, audit = fit_template_hair(
-                    folder,
-                    p,
-                    faces,
-                    0,
-                    NS(cameras={1: camera}),
-                    {'view.png': {'yaw': 0, 'landmarks': landmarks}},
-                    [im],
-                    np.zeros(3),
-                    np.eye(3),
-                    {'scale': 1},
-                    regions,
-                )
+            (folder / 'capture.json').write_text(
+                json.dumps({'frames': [{'filename': 'view.png'}]})
+            )
+            staged = folder / 'staged'
+            staged.mkdir()
+            out, audit = fit_template_hair(
+                folder,
+                p,
+                faces,
+                0,
+                NS(cameras={1: camera}),
+                {'view.png': {'yaw': 0, 'landmarks': landmarks}},
+                [im],
+                np.zeros(3),
+                np.eye(3),
+                {'scale': 1},
+                regions,
+                output_folder=staged,
+            )
+            # A first build must not change the accepted legacy snapshot while
+            # producing evidence, or publication rejects its own new model.
+            self.assertTrue((staged / 'frame-evidence.json').exists())
+            self.assertFalse((folder / 'frame-evidence.json').exists())
         np.testing.assert_array_equal(out[:472], p[:472])
         self.assertGreater(np.linalg.norm(out[472:] - p[472:]), 0.001)
         self.assertEqual(audit['earVerticesProtected'], 4)
@@ -298,7 +304,7 @@ class EarTests(unittest.TestCase):
                 np.testing.assert_array_equal(result[3], results[0][3])
                 np.testing.assert_array_equal(result[-1], results[0][-1])
 
-    def test_photographed_outline_removes_skull_vertices_from_template_ear_label(self):
+    def test_photographed_outline_cannot_remove_anatomical_ear_identity(self):
         p = np.array(
             [
                 [-0.25, -0.1, 0],
@@ -354,8 +360,10 @@ class EarTests(unittest.TestCase):
                 np.eye(3),
                 {'scale': 1},
             )
-        self.assertEqual(regions['-1']['coreVertices'], [0, 1, 2])
-        self.assertEqual(report['-1']['reclassifiedAdjacentSurface'], 3)
+        self.assertEqual(regions['-1']['coreVertices'], list(range(6)))
+        self.assertEqual(regions['-1']['anatomicalCoreVertices'], list(range(6)))
+        self.assertEqual(report['-1']['earVertices'], 6)
+        self.assertFalse(report['-1']['geometryChanged'])
 
     def test_face_coverage_cannot_count_unobserved_template_neck_as_missing_face(self):
         cage = np.zeros((468, 3))

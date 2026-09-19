@@ -12,7 +12,7 @@ from head_artifacts import HeadArtifactTransaction, published_folder
 from scripts.fit_head_template import fit_template
 from scripts.head_semantics import analyze
 from scripts.ear_fit import triangulate_ears, fit_ears, refine_ear_ownership
-from scripts.head_accessories import build_glasses, sample_frame_colors
+from scripts.fitted_eyewear import fit_photo_glasses
 from scripts.photo_geometry import bake_photographs
 from scripts.hair_recognition import hair_completion
 
@@ -40,8 +40,10 @@ def _rebuild(folder, geometry_only, publication):
             shutil.copy2(accepted / name, backup / name)
     original = json.loads((backup / 'mesh.json').read_text())
     baseline = accepted / 'pre-ear-surface.npz'
+    baseline_payload = {}
     if baseline.exists():
         with np.load(baseline, allow_pickle=False) as saved:
+            baseline_payload = {key: saved[key].copy() for key in saved.files}
             if (
                 str(saved['captureHash'])
                 != hashlib.sha256((folder / 'capture.json').read_bytes()).hexdigest()
@@ -105,7 +107,63 @@ def _rebuild(folder, geometry_only, publication):
     measurements = triangulate_ears(
         folder, rec, center, B, original['transform'], semantics
     )
-    p, audit = fit_ears(p, f, count, info['earRegions'], measurements)
+    from scripts.ear_contour_rest import (
+        contour_rest_fields,
+        load_contour_rest,
+        measurement_digest,
+    )
+
+    current_positions = np.array(current['positions']).reshape(-1, 3)
+    rest = load_contour_rest(
+        baseline_payload,
+        current_positions,
+        f,
+        count,
+        measurements,
+    )
+    if rest is not None:
+        p = rest
+        audit = current['stats']['earFit']
+        info['earRegions'] = json.loads(
+            json.dumps(current['stats']['templateFit']['earRegions'])
+        )
+    elif (accepted / 'ear-measurements.json').exists() and measurement_digest(
+        json.loads((accepted / 'ear-measurements.json').read_text())
+    ) == measurement_digest(measurements):
+        if current['stats'].get('earContourFit'):
+            raise ValueError(
+                'Refined contours are missing their rest snapshot; run the complete pipeline.'
+            )
+        # One-time migration of an accepted legacy surface. Later shape edits
+        # may have followed ear fitting; replaying the nonlinear fit would
+        # silently change them. Keep the independent pre-ear quality baseline.
+        p = current_positions
+        audit = current['stats']['earFit']
+        info['earRegions'] = json.loads(
+            json.dumps(current['stats']['templateFit']['earRegions'])
+        )
+    else:
+        p, audit = fit_ears(p, f, count, info['earRegions'], measurements)
+    for region in info['earRegions'].values():
+        region['coreVertices'] = region.get(
+            'anatomicalCoreVertices', region['coreVertices']
+        ).copy()
+    rest_fields = contour_rest_fields(p, f, measurements)
+    from scripts.ear_contour_pipeline import refine_capture_ear_contours
+
+    p, contour_audit = refine_capture_ear_contours(
+        folder,
+        p,
+        f,
+        count,
+        info['earRegions'],
+        semantics,
+        rec,
+        center,
+        B,
+        original['transform'],
+        baseline=np.array(original['positions']).reshape(-1, 3),
+    )
     mesh = trimesh.Trimesh(p, f, process=False)
     if not mesh.is_watertight or not np.isfinite(p).all():
         raise ValueError('Refinement failed topology validation.')
@@ -115,13 +173,14 @@ def _rebuild(folder, geometry_only, publication):
         np.savez_compressed(folder / 'ear-fit-preview.npz', positions=p, indices=f)
         return
     # Fit from the same baseline on every rerun. Facial rig vertices and face
-    # triangles are fixed. Reconstruct hair bindings on the corrected envelope;
-    # pinning stale roots near the old ears prevents an accurate ear placement.
+    # triangles are fixed. Transport conformed hair stations to the corrected
+    # envelope while retaining their photographic appearance and correspondence.
     data = current
     data['positions'] = p.astype(np.float32).ravel().tolist()
     data['normals'] = np.asarray(mesh.vertex_normals, dtype=np.float32).ravel().tolist()
     data['stats']['templateFit']['earRegions'] = info['earRegions']
     data['stats']['earFit'] = audit
+    data['stats']['earContourFit'] = contour_audit
     data['stats']['earOwnership'] = refine_ear_ownership(
         folder, p, f, info['earRegions'], semantics, rec, center, B, data['transform']
     )
@@ -149,6 +208,7 @@ def _rebuild(folder, geometry_only, publication):
             for key in (
                 'withheldSurfaceLandmarks',
                 'earFit',
+                'earContourFit',
                 'earOwnership',
             )
         }
@@ -159,9 +219,20 @@ def _rebuild(folder, geometry_only, publication):
     previous_hair = current.get('accessories', {}).get('hair')
     if previous_hair:
         advice['hair'] = {**advice['hair'], **previous_hair['parameters']}
-    groom = build_hair_groom(
-        p, f, advice, rec, center, B, data['transform'], folder, info['earRegions']
-    )
+    if ((previous_hair or {}).get('photoGuides') or {}).get('surfaceConformed'):
+        from scripts.hair_surface_transport import transport_photo_groom
+
+        groom, transport = transport_photo_groom(
+            previous_hair,
+            np.array(json.loads(snapshot)['positions']).reshape(-1, 3),
+            np.asarray(data['positions']).reshape(-1, 3),
+            f,
+        )
+        data['stats']['hairSurfaceTransport'] = transport
+    else:
+        groom = build_hair_groom(
+            p, f, advice, rec, center, B, data['transform'], folder, info['earRegions']
+        )
     if previous_hair and not groom:
         raise ValueError(
             'Corrected head has insufficient hair evidence; previous model retained.'
@@ -175,12 +246,9 @@ def _rebuild(folder, geometry_only, publication):
             'recognition': groom['recognition'],
             **groom['evidence'],
         }
-    glasses = build_glasses(p, advice, rec, frames, center, B, data['transform'])
-    if glasses:
-        color = sample_frame_colors(folder, advice)
-        if color:
-            glasses['frameColor'] = color
-    data['accessories']['glasses'] = glasses
+    data['accessories']['glasses'] = fit_photo_glasses(
+        folder, p, advice, rec, frames, center, B, data['transform']
+    )
     # Float32 is the persisted/rendered mesh; hash those exact same positions.
     p = np.asarray(data['positions']).reshape(-1, 3)
     eyes = (
@@ -205,6 +273,11 @@ def _rebuild(folder, geometry_only, publication):
         info['earRegions'],
         output_folder=publication.stage,
     )
+    if baseline_payload:
+        np.savez_compressed(
+            publication.stage / 'pre-ear-surface.npz',
+            **{**baseline_payload, **rest_fields},
+        )
     atomic(publication.stage / 'mesh.json', data)
     publication.commit()
     print('Published validated head details. Backup:', backup, flush=True)

@@ -71,6 +71,13 @@ document.querySelector('#app').innerHTML = /* HTML */ ` <header>
           Record / upload head video</button
         ><button id="import-face" class="full small" style="margin-bottom:7px">
           ↑ Upload GLB head</button
+        ><button
+          id="import-portrait"
+          class="full small"
+          style="margin-bottom:7px"
+          title="Single-photo preview with estimated depth"
+        >
+          ↑ Upload portrait photo</button
         ><button id="reference" class="full small">↺ Reset to reference</button
         ><input id="face-file" type="file" accept=".glb,.json" />
         <p id="photo-count" class="muted">Saved multiview photos</p>
@@ -2152,6 +2159,7 @@ $('snapshot').onclick = async () => {
   if (tracking.active) await photoFace($('webcam'));
 };
 $('photo-import').onclick = () => $('photo-file').click();
+$('import-portrait').onclick = () => $('photo-file').click();
 $('photo-file').onchange = async (e) => {
   const file = e.target.files[0];
   if (!file) return;
@@ -2161,6 +2169,12 @@ $('photo-file').onchange = async (e) => {
     image.src = url;
     await image.decode();
     await photoFace(image);
+  } catch (error) {
+    const message =
+      'Could not read this photo. Choose a supported image such as JPG or PNG.';
+    $('capture-result').textContent = message;
+    toast(message);
+    console.error(error);
   } finally {
     URL.revokeObjectURL(url);
     e.target.value = '';
@@ -2574,7 +2588,17 @@ async function recover() {
   }
 }
 
-recover();
+recover().then(async () => {
+  const candidate = new URLSearchParams(location.search).get('nativePreview');
+  if (candidate) {
+    try {
+      const { loadNativeHeadPreview } = await import('./native-head-preview.js');
+      await loadNativeHeadPreview(candidate);
+    } catch (error) {
+      toast(error.message);
+    }
+  }
+});
 
 const meshyState = { busy: false, lastGLB: null, taskId: null };
 

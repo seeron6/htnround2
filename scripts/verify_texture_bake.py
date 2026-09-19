@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -36,11 +37,16 @@ def _offline_source_guard(source):
     """Audit Python writes through source symlinks, and reject network/process IO."""
     state = {'active': True}
     write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+    # A private candidate can itself borrow immutable inputs from a capture.
+    # Resolving a worker's symlink may then leave the candidate directory, so
+    # protect those explicit input targets as well as the source bundle.
+    roots = {source.resolve()}
+    roots.update(item.resolve() for item in source.iterdir() if item.is_symlink())
 
     def protected(path):
         if isinstance(path, (str, bytes, os.PathLike)):
             resolved = Path(os.fsdecode(path)).resolve()
-            return resolved == source or source in resolved.parents
+            return any(resolved == root or root in resolved.parents for root in roots)
         return False
 
     def audit(event, args):
@@ -130,12 +136,14 @@ def _stage(source, destination):
 
 
 def _cached_detail(folder):
+    from scripts.photo_detail import DETAIL_CACHE_VERSIONS
+
     path = folder / 'photo-detail.json'
     if path.exists():
         data = _json(path)
         _require(
-            data.get('version') == 2,
-            'Cached-only verification requires photo-detail version 2.',
+            data.get('version') in DETAIL_CACHE_VERSIONS,
+            'Cached-only verification requires a recognized photo-detail version (2 or 3).',
         )
         for frame in data.get('frames', []):
             _require(
@@ -259,6 +267,33 @@ def _normalized(value, stage):
     return value
 
 
+def _run_isolated(stage, workers, source):
+    """Use a fresh interpreter so shared state cannot hide repeatability bugs."""
+    process = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            str(source),
+            '--worker-stage',
+            str(stage),
+            '--workers',
+            str(workers),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if process.returncode:
+        detail = '\n'.join((process.stdout + '\n' + process.stderr).splitlines()[-16:])
+        raise RuntimeError(f'Isolated {workers}-worker bake failed:\n{detail}')
+    record = _json(stage / 'verification-worker-result.json')
+    return (
+        _json(stage / 'texture-atlas.json'),
+        record['seconds'],
+        record['positionsSha256'],
+    )
+
+
 def local_code_fingerprint(root, entrypoints):
     """Include local imported helpers, even imports inside bake functions.
 
@@ -348,7 +383,7 @@ def verify(source, report=None):
             'camera_ownership',
             'camera_texture',
         )
-    ] + [ROOT / 'head_artifacts.py']
+    ] + [ROOT / 'head_artifacts.py', Path(__file__).resolve()]
 
     def code_fingerprint():
         return local_code_fingerprint(ROOT, tracked)
@@ -356,7 +391,6 @@ def verify(source, report=None):
     code_before = code_fingerprint()
     try:
         with (
-            _offline_source_guard(source),
             tempfile.TemporaryDirectory(
                 prefix='verify-texture-serial-', dir=local
             ) as first,
@@ -366,19 +400,20 @@ def verify(source, report=None):
         ):
             stages = [Path(first), Path(second)]
             # Snapshot mutable metadata for both runs before starting either.
-            for stage in stages:
-                _stage(source, stage)
-                _require(
-                    (stage / 'mesh.json').read_bytes() == snapshot,
-                    'Source mesh changed while staging the verifier.',
-                )
+            with _offline_source_guard(source):
+                for stage in stages:
+                    _stage(source, stage)
+                    _require(
+                        (stage / 'mesh.json').read_bytes() == snapshot,
+                        'Source mesh changed while staging the verifier.',
+                    )
             results = []
             for stage, workers in zip(stages, (1, 4)):
                 print(
                     f'Verifying cached texture bake with {workers} worker(s)...',
                     flush=True,
                 )
-                results.append(_run(stage, workers))
+                results.append(_run_isolated(stage, workers, source))
                 print(f'{workers} worker(s): {results[-1][1]:.2f}s', flush=True)
             a, b = results[0][0], results[1][0]
             for key in ('mapping', 'indices', 'uv', 'positionsSha256'):
@@ -438,6 +473,7 @@ def verify(source, report=None):
             result = {
                 'verified': True,
                 'workers': [1, 4],
+                'workerIsolation': 'Fresh Python interpreter per bake; each prohibits network, subprocesses and source writes.',
                 'seconds': [round(item[1], 3) for item in results],
                 'pngSha256': hashes,
                 'positionsSha256': results[0][2],
@@ -497,9 +533,30 @@ if __name__ == '__main__':
         type=Path,
         help='Optional JSON evidence outside the source capture; no model artifacts are published.',
     )
+    parser.add_argument('--worker-stage', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument(
+        '--workers', type=int, choices=(1, 4), default=4, help=argparse.SUPPRESS
+    )
     args = parser.parse_args()
     try:
-        verify(args.capture, args.report)
+        if args.worker_stage is None:
+            verify(args.capture, args.report)
+        else:
+            source, stage = args.capture.resolve(), args.worker_stage.resolve()
+            _require(
+                stage != source and source not in stage.parents,
+                'Verification worker stage must be outside the source capture.',
+            )
+            from scripts.pipeline_accel import install_leaves
+            from face_pipeline import atomic
+
+            install_leaves()
+            with _offline_source_guard(source):
+                _, seconds, positions = _run(stage, args.workers)
+                atomic(
+                    stage / 'verification-worker-result.json',
+                    {'seconds': seconds, 'positionsSha256': positions},
+                )
     except Exception as error:
         print('Texture verification failed: ' + str(error), file=sys.stderr)
         raise SystemExit(1)

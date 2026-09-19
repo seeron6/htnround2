@@ -155,19 +155,18 @@ export class SurfaceAppearance extends THREE.Mesh {
 // glTF stores separate vertices across UV seams. Restore a welded simulation
 // surface while retaining the original render indices and UVs on re-import.
 export function weldTexturedSurface(source) {
-  const input = source.attributes.position.array,
+  const input = source.attributes.position,
     positions = [],
     mapping = [],
     lookup = new Map();
-  for (let i = 0; i < input.length; i += 3) {
-    const key = [input[i], input[i + 1], input[i + 2]]
-      .map((x) => Math.round(x / 1e-7))
-      .join(',');
+  for (let i = 0; i < input.count; i++) {
+    const point = [input.getX(i), input.getY(i), input.getZ(i)];
+    const key = point.map((x) => Math.round(x / 1e-7)).join(',');
     let index = lookup.get(key);
     if (index === undefined) {
       index = positions.length / 3;
       lookup.set(key, index);
-      positions.push(input[i], input[i + 1], input[i + 2]);
+      positions.push(...point);
     }
     mapping.push(index);
   }
@@ -180,6 +179,13 @@ export function weldTexturedSurface(source) {
   geometry.computeVertexNormals();
   return {
     geometry,
-    atlas: { mapping, indices, uv: Array.from(source.attributes.uv.array) },
+    atlas: {
+      mapping,
+      indices,
+      uv: Array.from({ length: input.count }, (_, i) => [
+        source.attributes.uv.getX(i),
+        source.attributes.uv.getY(i),
+      ]).flat(),
+    },
   };
 }
