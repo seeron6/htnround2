@@ -260,10 +260,11 @@ def smooth_bounded_delta(points, faces, delta, strength=5):
     degree = matrix.diagonal()
     result = delta.copy()
     lower, upper = np.minimum(delta, 0), np.maximum(delta, 0)
+    degree_term = degree[:, None] if np.asarray(delta).ndim == 2 else degree
     for _ in range(180):
-        neighbors = degree * result - matrix @ result
+        neighbors = degree_term * result - matrix @ result
         updated = np.clip(
-            (delta + strength * neighbors) / (1 + strength * degree), lower, upper
+            (delta + strength * neighbors) / (1 + strength * degree_term), lower, upper
         )
         if np.max(abs(updated - result), initial=0) < 1e-8:
             result = updated
@@ -380,7 +381,10 @@ def complete_capture_crown_geometry(
         unique, delta, capture, rec, center, basis, scale
     )
     desired = mesh.vertices.copy()
-    desired[:, 1] += delta[inverse]
+    if np.asarray(delta).ndim == 1:
+        desired[:, 1] += delta[inverse]
+    else:
+        desired += delta[inverse]
     result, quality = bounded_surface_step(mesh.vertices, desired, mesh.faces)
     actual = result - mesh.vertices
     mesh.vertices = result

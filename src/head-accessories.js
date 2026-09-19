@@ -99,7 +99,12 @@ function eyewearEnvironment() {
 
 // Sweep a bevelled rectangular section. Acetate frames have flat faces and
 // small edge radii; circular TubeGeometry makes them look like bent wire.
-function sweep(path, closed, section, segments = 96) {
+function sweep(path, closed, section, segments = 96, breaks = []) {
+  const times = [...new Set([
+    ...Array.from({ length: segments + 1 }, (_, i) => i / segments),
+    ...breaks,
+  ])].sort((a, b) => a - b);
+  segments = times.length - 1;
   const positions = [],
     indices = [],
     // Acetate has a broad, almost planar face with a small rounded bevel.
@@ -107,7 +112,7 @@ function sweep(path, closed, section, segments = 96) {
     // into a thin circular wire.
     sides = 20;
   for (let i = 0; i <= segments; i++) {
-    const t = i / segments,
+    const t = times[i],
       p = path.getPoint(t),
       tangent = path.getTangent(t).normalize();
     const { axis, width, depth } = section(t, p, tangent);
@@ -137,7 +142,7 @@ function sweep(path, closed, section, segments = 96) {
   if (!closed)
     for (const end of [0, segments]) {
       const c = positions.length / 3;
-      positions.push(...path.getPoint(end / segments).toArray());
+      positions.push(...path.getPoint(times[end]).toArray());
       for (let j = 0; j < sides; j++) {
         const a = end * sides + j,
           b = end * sides + ((j + 1) % sides);
@@ -389,7 +394,9 @@ export class HeadGlasses extends THREE.Group {
           // the measured shaft path, while giving the side panel enough depth
           // to produce a real edge highlight in profile views.
           depth: 0.0031 * (1 - 0.25 * t),
-        })),
+        }), 96, spec.templePathMode === 'fitted-polyline'
+          ? path.getCurveLengths().map((length) => length / path.getLength())
+          : []),
         material,
         `Eyeglass temple ${i + 1}`,
       );

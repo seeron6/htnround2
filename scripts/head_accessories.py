@@ -279,12 +279,16 @@ def fit_temple(hinge, sign, spec, rec, center, B, scale, p):
             )
     if candidates:
         _, q, name = min(candidates, key=lambda v: v[0])
+        observed_count = len(q)
         if q[-1, 1] > hinge[1] - 0.012:
             q = np.vstack([q, q[-1] + [sign * -0.002, -0.014, -0.012]])
+        source = next(im for im in rec.images.values() if im.name == name)
         return q, {
             'method': 'profile-contour',
             'view': name,
             'lateralDepthEstimated': True,
+            'observedPointCount': observed_count,
+            'cameraOrigin': ((source.projection_center() - center) @ B.T * scale).tolist(),
         }
     q = np.array(
         [

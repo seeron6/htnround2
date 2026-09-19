@@ -230,18 +230,21 @@ test('surface-fitted arms keep their clearance path through serialization and th
     c = new THREE.Vector3(...spec.temples[0][2]),
     line1 = new THREE.Line3(a, b),
     line2 = new THREE.Line3(b, c);
-  const sides = (p.count - 2) / 97;
-  for (let section = 0; section <= 96; section++) {
+  const sides = 20, sections = (p.count - 2) / sides;
+  let retainedBend = false;
+  for (let section = 0; section < sections; section++) {
     const center = new THREE.Vector3();
     for (let j = 0; j < sides; j++)
       center.add(new THREE.Vector3().fromBufferAttribute(p, section * sides + j));
     center.divideScalar(sides);
+    retainedBend ||= center.distanceTo(b) < 1e-8;
     const distance = Math.min(
       center.distanceTo(line1.closestPointToPoint(center, true, new THREE.Vector3())),
       center.distanceTo(line2.closestPointToPoint(center, true, new THREE.Vector3())),
     );
     assert.ok(distance < 1e-8, 'Keep every swept section on its fitted segment');
   }
+  assert.ok(retainedBend, 'Sweep the actual bend rather than bridging across it');
   assert.deepEqual(
     p.array,
     restored.getObjectByName('Eyeglass temple 1').geometry.attributes.position.array,
