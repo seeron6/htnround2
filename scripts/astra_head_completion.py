@@ -10,6 +10,7 @@ import numpy as np
 from PIL import Image
 from openai_capture import request
 from face_pipeline import atomic
+from scripts.parallel_annotations import request_views
 
 VERSION = 2
 
@@ -225,13 +226,17 @@ def complete(folder, evidence, frames=None):
                 },
             ]
         )
-    result = request(
+    result = request_views(
         content,
         SCHEMA,
+        [f['filename'] for f in chosen],
+        request,
+        label='head',
+        cache=folder / 'annotation-cache' / 'head',
         model_override='gpt-6-astra',
         max_output_tokens=32000,
         reasoning='low',
-        timeout=600,
+        timeout=90,
     )
     names = {f['filename'] for f in chosen}
     if {v['filename'] for v in result['views']} != names:

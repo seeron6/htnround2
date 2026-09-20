@@ -13,6 +13,39 @@ evidence tags and recipes are in [OPEN_SOURCE_STACK.md](OPEN_SOURCE_STACK.md). R
   **Keep these hooks when editing:** the second `<script>` in `index.html`; the `window.__punchingFace.remotePunch` block at
   the end of `src/main.js`; the `sponsor_obs` lines in `server.py`, `physics_server.py`, `face_pipeline.py` and
   `scripts/build_photo_face.py`. `tests/sponsors-hook.test.mjs` fails if one is lost: restore the hook, keep the test.
+- **Sentry is ON** since 2026-09-20 (org `punchingface.sentry.io`; what it found and how it is wired:
+  [TRACKS/SENTRY.md](TRACKS/SENTRY.md)). `npm run sentry:doctor` must end `ALL PASS`; services read the DSN only at
+  start-up, so restart `npm run dev` after changing it. **Keep these hooks too** (`tests/sentry-browser.test.mjs`
+  fails if one is lost): `startFlightRecorder()` / `afterSentryStarts(dock)` in `src/sponsors/boot.js`; `obs.flow(` and
+  `within(() => fetch(` around the turn in `src/sponsors/cornerman.js`; the `punching-face-contact` event with
+  `time: performance.now()` in `src/main.js` (it is what puts punches into replays); `sponsor_obs.traced(` and
+  `sponsor_obs.job_state(state)` in `meshy_backend.py`; `sponsor_obs.capture(crash` in `physics_server.py`; the
+  `agent_span` / `tool_span` / `turn_span` lines in `sponsor_server.py`. Never add `replayCanvasIntegration`, feedback
+  screenshots or `networkDetailAllowUrls`: the canvas is a face and request bodies hold webcam frames.
+  `CONTACT_PHYSICS_SLEEP=1` (off by default) lets a face at rest stop simulating: `newton_face.py`, finding 1.
+- **The face's expression is chosen twice** (finding 2 there): on the device the instant a punch lands
+  (`src/sponsors/instant-expression.js`, pure, ~25 ms), then by OMNI's `set_expression` call 1 to 2.7 s later, which
+  confirms or corrects it. Both go through `wear()` in `src/sponsors/cornerman.js`; the `react(triggers, now)` call at
+  the top of `onPunch`, the `guess` line after `turn(...)`, and the `data-k="instant"` checkbox are the hooks
+  (`tests/instant-expression.test.mjs` fails if one is lost). Rules that must survive edits: the device never picks
+  `amused` or `concerned` and never replaces a showing `concerned`; `expression.set()` on the look already showing
+  must sustain it, not restart it (or OMNI agreeing makes the face twitch); the thresholds are `gruntLevel`'s, which
+  mirror `intensity_of()` in `omni_senses.py`, and that test asks the real Python function, so change both or neither.
+- **The face's voice** ([docs/FACE_VOICE.md](docs/FACE_VOICE.md)): OMNI's own voice first, ElevenLabs as the backup, the
+  browser's `speechSynthesis` last. The backup lives in `elevenlabs_voice.py`; the OMNI cast (`OMNI_VOICES`, only voices
+  yibuapi accepts) and the fallback order live in `sponsor_server.py::coach`; the pickers and **Hear it** buttons are in
+  `src/sponsors/cornerman.js`. yibuapi reports some failures (an unsupported voice) *inside a 200 stream*:
+  `omni_stream` reads them, keep that. `tests/face_voice_test.py` covers every path with a fake upstream
+  (`npm run test:sponsors`); `scripts/voice_audition.py` re-checks which voices the live keys accept.
+- **What OMNI gets and gives each turn** ([TRACKS/OMNI_JUDGES.md](TRACKS/OMNI_JUDGES.md), the rubric map with measured
+  numbers; [DEMO.md](DEMO.md), the script): `omni_senses.py` builds the request (keyframes as one `video`, room sound on
+  punch-triggered turns, a tone direction from the measured punch) and the parallel `set_expression` function call;
+  `src/sponsors/expression.js` draws that expression through `window.__faceSpeech` (no `main.js` change);
+  `src/sponsors/grunts.js` plays cached OMNI-voice grunts from `public/omni-reactions/` the instant a punch lands
+  (rebuild: `scripts/build_omni_reactions.py`). **Before a demo run `.venv/bin/python scripts/omni_preflight.py`**: it
+  exercises all of it against the live model. The Realtime engine (`omni_relay.py`, `src/omni/`, `?arena_omni=1`) is NOT
+  wired to the mic or speakers and is not the demo path. `qwen3.8-omni-flash` refuses audio output on yibuapi: keep
+  `qwen3.5-omni-flash`. `npm run dev` now also starts `sponsor_server.py` (skipped if :5176 is taken).
 - **Meshy engine** (README "Reconstruction engines"): the scan dialog can build a saved scan with Meshy's cloud
   image-to-3D instead of the local pipeline. All of it is in `meshy_backend.py`, `src/meshy-engine.js` and
   `src/meshy-engine.css`. **Keep these hooks when editing:** `import meshy_backend`, the `MESHY = ...` line, the two
@@ -22,6 +55,31 @@ evidence tags and recipes are in [OPEN_SOURCE_STACK.md](OPEN_SOURCE_STACK.md). R
   and `window.__labReady`, so it needs no code in `main.js`: keep those ids. `tests/meshy-engine-hook.test.mjs`
   fails if any of this is lost. Never start a second `server.py` on the real `.local/face-captures`: `FaceStore`
   marks every running job there as failed at start-up. Point `CONTACT_FACE_CAPTURES` at a copy instead.
+- **Lip topology** ([docs/LIP_TOPOLOGY.md](docs/LIP_TOPOLOGY.md)): every head, from either engine, gets lips that can
+  part when it is loaded. `src/lip-topology.js` (pure geometry) either **cuts** a seam into sealed lips (Meshy:
+  refine, cut, add a mouth pouch) or **adopts** lips that are already parted (local pipeline: label them, darken
+  the inside). `src/lip-fit.js` is the glue; the rigs read `geometry.userData.lipTopology`. **Keep when editing:**
+  in `src/main.js` the `lip-fit.js` import, `fitLips`, `adoptLipGeometry`, the token and `settle` wait at the top
+  of `fitMouth`, and in `loadPhotoFace` the `await fitMouth(…, cage)` that comes BEFORE `new NewtonFaceDynamics`
+  together with `growBinding(binding, mesh.geometry)` (a cut changes the vertex count, and Newton must bind to
+  the final buffer); `setLipTopology`/`seamJaw` in `src/physics.js`; `_buildFromLips` in `src/speech-rig.js`;
+  `shadeMouth` in `src/surface-appearance.js`; `prepare` and landmarks 78/308 in `src/lip-detect.js`.
+- **Pain rig and bone breaks** ([docs/PAIN_RIG.md](docs/PAIN_RIG.md)): in Live head · elastic a blow gets a three-pose
+  reaction (flinch, grimace, ache), a head flinch and a gasp from `src/pain-rig.js`, and a magnitude of 0.70 or more
+  on bone leaves a slight, capped break plus swelling from `src/bone-fracture.js` (this replaced the `> 0.90` damage
+  rule; `src/pain-expression.js` is now a re-export). **Keep when editing:** in `src/impact-rig.js` the `BLEND` list,
+  `headPose`/`gasp`, the `offThread` marker and the `wouldFracture` gate (a breaking blow must stay on the ordered
+  main-thread path; everything else must still reach the worker after a break); `bones` in `TissueField.anatomy`
+  and the `fractureField` call in `build`; in `src/physics.js` AND `src/newton-dynamics.js` the
+  `.addScaledVector(this.impactRig.headPose, 40 * …)` spring term and the third argument of
+  `speechRig.step(dt, this.speechDuck, this.impactRig.gasp)`; the `gasp` floor in `FaceSpeechRig.step`; the
+  `wouldFracture` skip in `src/impact-worker.js`. `tests/pain-rig.test.mjs` and `tests/bone-fracture.test.mjs`
+  fail if one is lost. Every event array must stay a top-level typed array (the worker transfers only those).
+  Every such head also gets **teeth and a tongue** (`src/mouth-interior.js`), built in `fitMouth` and moved each
+  frame by `mouthInterior.update({ swing: dynamics.jawSwing, offsets: [...] })` in the render loop: keep that call,
+  `jawSwing` in `src/physics.js` and `jaw`/`openNow` in `src/speech-rig.js`.
+  `window.__faceDetection.lips` says what happened to the current head (`cut`, `adopted`, or why it was refused).
+  Do not go back to deleting triangles to open a mouth: on Meshy's ~6 mm lip triangles that is the black-shard bug.
 - `PIPELINE_SPEEDUP.md`: measured video-to-model timings (fresh build 309 s serial, 122 s accelerated, identical outputs)
   and the recipe for the rest. The server now launches `scripts/build_photo_face_fast.py`, which installs
   `scripts/pipeline_accel.py` and then calls `build_photo_face.run()` unchanged. If you edit `photo_geometry.zbuffer`,

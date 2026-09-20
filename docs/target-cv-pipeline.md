@@ -1,5 +1,41 @@
 # Target-perspective punch pipeline — architecture
 
+## Integration into the main punching app
+
+Ported from `akashngb/punching-face` branch `jace/cv`, commit `d0c1763`, on 2026-09-19.
+The original architecture below describes the branch's debug app; the main app now uses
+`WebcamPunching` in `src/punch-mapping.js` to connect it to the existing deformation rig.
+
+- `public/tracking-worker.js` supplies landmarks, world landmarks and the branch's motion
+  evidence, extracted into `public/target-motion.js`. The existing webcam and arm-capture
+  worker are shared; punching does not open a second camera or run a second hand model.
+- `TargetTracking.consume()` feeds those results through the rigid fist estimator and
+  trajectory extractor. Closed fists support straights, left/right hooks, uppercuts and
+  overhands. The previous palm-growth and virtual-hand collision triggers no longer also
+  fire, so there is one local webcam contact source. Button and remote arena inputs remain.
+- The target uses fitted facial landmarks (including the reference model's measured speech
+  landmarks) rather than the full neck/shoulder bounds. Raycasts follow the strike direction
+  onto the current editable mesh. Inward crossings are required; nearby silhouette grazes
+  can snap to a mesh vertex, while distant misses are rejected. Three r180 hit normals are
+  mesh-local, so the adapter keeps points, normals and forces in that same coordinate frame.
+- Contacts pass through the existing `contact()` function and emit its existing event with
+  extra `cv` metadata: measured trajectory, hand/type, normal and tangential speed, and
+  confidence. Current live/clay deformation, strength limits, accessories and Newton hooks
+  are unchanged. Model replacement, camera disconnect and capture/onboarding pauses reset
+  pending trajectories.
+- **Mirrored camera feed** corrects virtual cameras that deliver mirrored pixels. The default
+  is a raw webcam feed. Guard calibration continues to place the displayed hands/arms; the
+  target-camera punch solve itself does not depend on it.
+
+Validation: `npm test`, `npm run build`, and browser replay through
+`window.__punchingFace.feedPunchFrames()` using `tests/helpers/punch-replay.mjs`.
+Replay exercises classification, mesh projection and visible deformation, but does not
+measure recognition accuracy for real people punching under venue lighting. Speed remains
+a monocular estimate based on assumed field of view and learned hand size; impact location
+and tissue response are prototype approximations.
+
+## Original branch architecture
+
 Written 2026-09-19. This documents the rewrite of the target-camera CV pipeline
 (`src/target-camera.js` + `src/punch-events.js` + `public/target-worker.js`), which replaced the
 per-track online lifecycle that previously lived in `target-camera.js`. Read this before touching

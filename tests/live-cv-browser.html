@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Live CV frame review</title>
+    <style>
+      body {
+        font: 16px system-ui;
+        margin: 24px;
+        background: #eef0ec;
+        color: #192820;
+      }
+      .views {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        gap: 20px;
+      }
+      canvas,
+      video {
+        width: 100% !important;
+        height: auto !important;
+      }
+      .stage {
+        position: relative;
+        height: 360px;
+        background: #263237;
+      }
+      pre {
+        white-space: pre-wrap;
+        max-height: 220px;
+        overflow: auto;
+      }
+      #controls {
+        max-width: 420px;
+      }
+      button {
+        padding: 8px 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Live CV frame review</h1>
+    <p>
+      Generated arm images through the production camera tracker and cutout workers. No
+      webcam or microphone is used.
+    </p>
+    <button id="start">Run 12-second check</button>
+    <label
+      ><input id="stall" type="checkbox" checked /> Simulate missing video
+      callbacks</label
+    >
+    <pre id="metrics" role="status">Ready.</pre>
+    <div class="views">
+      <div id="input"></div>
+      <div id="stage" class="stage"></div>
+    </div>
+    <video id="video" autoplay playsinline muted hidden></video>
+    <div id="controls">
+      <button id="camera" hidden></button><button id="calibrate" hidden></button>
+    </div>
+    <script type="module">
+      import * as THREE from 'three';
+      import { Tracking } from '/src/hands.js';
+      import { PresetArm } from '/src/preset-arm.js';
+      import { LiveArms } from '/src/live-arms.js';
+      const $ = (id) => document.getElementById(id);
+      const video = $('video');
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color('#2b2b2f');
+      scene.add(new THREE.HemisphereLight(0xfffaf3, 0x555555, 1.5));
+      const key = new THREE.DirectionalLight(0xffefdf, 2.4);
+      key.position.set(0, 1.2, -1.4);
+      scene.add(key);
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(960, 540);
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      $('input').append(renderer.domElement);
+      const arms = [-1, 1].map(
+        (side) => new PresetArm(side, { style: 'bare', skin: '#bb8666' }),
+      );
+      scene.add(...arms);
+      const camera = new THREE.PerspectiveCamera(55, 16 / 9, 0.01, 10);
+      camera.position.set(0, -0.12, -1.05);
+      camera.lookAt(0, -0.14, 0);
+      const tracking = new Tracking(video, (message) => {
+        $('metrics').textContent = message;
+      });
+      const live = new LiveArms({ tracking, stage: $('stage'), mirrored: () => false });
+      const frameCallback = video.requestVideoFrameCallback.bind(video);
+      const latencies = [];
+      let running = false,
+        first = 0,
+        processed = 0,
+        detected = 0,
+        maxHands = 0,
+        maxPixels = 0,
+        lastStamp;
+      let summary;
+      function finish() {
+        running = false;
+        summary = {
+          processed,
+          detected,
+          maxHands,
+          cutoutFrames: live.frames,
+          maxPixels,
+          stalledCallbacks: $('stall').checked,
+          error: tracking.results?.detectError || null,
+          latencies,
+          maskReady: live.ready,
+          poseReady: live.poseReady,
+          videoTime: video.currentTime,
+          hidden: document.hidden,
+          lastStatus: live.state.status,
+          inferenceTimings: tracking.results?.timings,
+        };
+        tracking.stop();
+        live.worker?.terminate();
+        live.worker = null;
+        live.poseWorker?.terminate();
+        live.poseWorker = null;
+        renderer.setAnimationLoop(null);
+        $('start').disabled = false;
+        $('metrics').textContent = JSON.stringify(summary, null, 2);
+        window.cvReview = summary;
+      }
+      $('start').onclick = async () => {
+        live.resetWorker();
+        renderer.setAnimationLoop(draw);
+        $('start').disabled = true;
+        processed = detected = maxHands = maxPixels = live.frames = 0;
+        lastStamp = null;
+        latencies.length = 0;
+        const original = navigator.mediaDevices.getUserMedia.bind(
+          navigator.mediaDevices,
+        );
+        video.requestVideoFrameCallback = $('stall').checked
+          ? () => 999999
+          : frameCallback;
+        navigator.mediaDevices.getUserMedia = async () =>
+          renderer.domElement.captureStream(30);
+        try {
+          await tracking.start();
+          running = true;
+          first = performance.now();
+        } catch (error) {
+          $('metrics').textContent = error.stack;
+          $('start').disabled = false;
+        } finally {
+          navigator.mediaDevices.getUserMedia = original;
+        }
+      };
+      function draw(now) {
+        arms.forEach((arm, i) => {
+          arm.position.x = Math.sin(now / 850 + i) * 0.06;
+        });
+        renderer.render(scene, camera);
+        if (!running) return;
+        live.update(now);
+        const result = tracking.results;
+        if (result && result.timestamp !== lastStamp) {
+          lastStamp = result.timestamp;
+          processed++;
+          latencies.push(Math.round(tracking.pipelineLatency));
+          maxHands = Math.max(maxHands, result.landmarks.length);
+          if (result.landmarks.length) detected++;
+        }
+        maxPixels = Math.max(maxPixels, live.visiblePixels || 0);
+        $('metrics').textContent =
+          `Frames: ${processed} · hands: ${result?.landmarks?.length ?? 0} · cutouts: ${live.frames} · visible pixels: ${live.visiblePixels || 0}\n${live.state.status}`;
+        if (now - first >= 12000) finish();
+      }
+      draw(0);
+    </script>
+  </body>
+</html>

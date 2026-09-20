@@ -12,6 +12,9 @@ export class ImpactPreparation {
   ) {
     this.worker = makeWorker();
     this.pending = new Map();
+    this.byKey = new Map();
+    this.waiting = [];
+    this.inFlight = 0;
     this.cache = new Map();
     this.sequence = 0;
     this.epoch = 0;
@@ -30,8 +33,15 @@ export class ImpactPreparation {
       const job = this.pending.get(data.id);
       if (!job) return;
       if (data.stage === 'complete' && data.event) this.remember(job.key, data);
-      if (data.stage !== 'preview') this.pending.delete(data.id);
-      job.callback(data);
+      if (data.stage === 'preview') job.preview = data;
+      else {
+        this.pending.delete(data.id);
+        this.byKey.delete(job.key);
+        this.inFlight--;
+      }
+      // Each contact owns its age/refinement, even when its expensive pose is shared.
+      for (const callback of job.callbacks) this.deliver(callback, data);
+      this.drain();
     };
     this.worker.onerror = () => this.fail();
     this.configure(model);
@@ -60,24 +70,52 @@ export class ImpactPreparation {
       });
       return true;
     }
-    if (this.pending.size >= 4) return false;
+    const pending = this.byKey.get(key);
+    if (pending) {
+      pending.callbacks.push(callback);
+      if (pending.preview) this.deliver(callback, pending.preview);
+      return true;
+    }
     const id = ++this.sequence;
-    this.pending.set(id, { callback, key });
-    this.worker.postMessage({
+    const message = {
       type: 'impact',
       epoch: this.epoch,
       id,
       input,
       softness,
       reactionEnabled,
-    });
+    };
+    const job = { callbacks: [callback], key, message };
+    this.pending.set(id, job);
+    this.byKey.set(key, job);
+    this.waiting.push(job);
+    this.drain();
     return true;
+  }
+
+  deliver(callback, result) {
+    callback({
+      ...result,
+      event: result.event ? { ...result.event, age: 0, committed: 0 } : undefined,
+    });
+  }
+
+  drain() {
+    // Bound worker work in flight, not the number of valid punches. Waiting
+    // requests are tiny; matching contacts share a solve and retain every callback.
+    while (!this.disposed && !this.failed && this.inFlight < 4 && this.waiting.length) {
+      this.inFlight++;
+      this.worker.postMessage(this.waiting.shift().message);
+    }
   }
 
   invalidate() {
     this.resolveReady?.();
     this.epoch++;
     this.pending.clear();
+    this.byKey.clear();
+    this.waiting.length = 0;
+    this.inFlight = 0;
   }
 
   remember(key, result) {
@@ -93,8 +131,12 @@ export class ImpactPreparation {
     this.worker.terminate();
     const callbacks = [...this.pending.values()];
     this.pending.clear();
-    for (const { callback } of callbacks)
-      callback({ error: 'Impact worker unavailable' });
+    this.byKey.clear();
+    this.waiting.length = 0;
+    this.inFlight = 0;
+    for (const job of callbacks)
+      for (const callback of job.callbacks)
+        callback({ error: 'Impact worker unavailable' });
   }
 
   dispose() {

@@ -255,7 +255,12 @@ export function installDemoHUD({
     strengthMeter.setAttribute('aria-valuenow', String(points));
     strengthFill.style.transform = `scaleX(${strength})`;
 
-    const side = detail.side === 'left' ? 'LEFT' : 'RIGHT';
+    // Contacts reach here from the CV path ('left'/'right'), from a scripted punch, and from
+    // the rig's -1/+1 convention. Match all three: an unmatched value used to read as RIGHT.
+    const side =
+      detail.side === -1 || String(detail.side).toLowerCase() === 'left'
+        ? 'LEFT'
+        : 'RIGHT';
     const label =
       detail.mode === 'hook'
         ? `${side} HOOK`

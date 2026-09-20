@@ -1,6 +1,7 @@
 import qualityURL from './face-quality.js?url';
 import { loadMeshyModel } from './meshy-engine.js';
 import { acknowledgeScanJob, trackScanJob } from './scan-jobs.js';
+import { requestHeadName } from './head-name.js';
 
 async function api(path, data) {
   const response = await fetch(
@@ -65,8 +66,10 @@ async function savedFrame(photo) {
 }
 
 export async function startMeshyPhoto(photo) {
+  const name = await requestHeadName();
+  if (name === null) return null;
   const frame = await savedFrame(photo);
-  const capture = await api('face-captures', { captureRegion: 'head' });
+  const capture = await api('face-captures', { captureRegion: 'head', name });
   await api('face-frames', { id: capture.id, frames: [frame] });
   // The server stores the task and final GLB beside this photo, just as it does
   // for a multiview scan. Closing the page does not lose the model or the job.

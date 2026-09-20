@@ -49,7 +49,7 @@ const store = (storage, key, value) => {
 
 // The scene already knows how to take a third-party head: main.js normalises an uploaded GLB and finds its
 // facial anchors. Handing the Meshy model to that same input keeps one import path instead of two.
-async function importGLB(bytes) {
+async function importGLB(bytes, name = MODEL_NAME) {
   const input = $('face-file'),
     file = new File([bytes], MODEL_NAME + '.glb', { type: 'model/gltf-binary' });
   if (!input) throw new Error('The model importer is not ready yet.');
@@ -83,15 +83,15 @@ async function importGLB(bytes) {
     window.addEventListener('punching-face-model-error', failed);
     try {
       input.files = transfer.files;
-      input.dispatchEvent(new Event('change'));
+      input.dispatchEvent(new CustomEvent('change', { detail: { headName: name } }));
     } catch (error) {
       cleanup();
       reject(error);
     }
   });
-  $('model-name').textContent = MODEL_NAME;
+  $('model-name').textContent = name;
   const scene = $('scene-name').firstChild;
-  if (scene) scene.textContent = MODEL_NAME;
+  if (scene) scene.textContent = name;
   $('model-kind').textContent = 'Meshy AI head · textured';
   $('physics-engine').textContent =
     'Meshy import · preview springs + facial impact rig';
@@ -112,17 +112,22 @@ async function fetchModel(id) {
 
 // Saved heads are chosen through the library; completion and page load never replace the scene.
 export async function loadMeshyModel(id) {
-  await importGLB(await fetchModel(id));
+  const [bytes, capture] = await Promise.all([
+    fetchModel(id),
+    api('face-status?id=' + encodeURIComponent(id)),
+  ]);
+  const name = capture.name || MODEL_NAME;
+  await importGLB(bytes, name);
   store(sessionStorage, ACTIVE_KEY, id);
-  watchActive();
+  watchActive(name);
 }
 
 let nameObserver;
 // Any other model taking the scene (a local scan, an upload, the reference head) ends the Meshy session.
-function watchActive() {
+function watchActive(name) {
   nameObserver?.disconnect();
   nameObserver = new MutationObserver(() => {
-    if ($('model-name').textContent === MODEL_NAME) return;
+    if ($('model-name').textContent === name) return;
     nameObserver.disconnect();
     store(sessionStorage, ACTIVE_KEY, null);
   });
@@ -268,13 +273,13 @@ export class EngineChoice {
     $('engine-meshy-panel').hidden = !this.meshy;
     const cost = `about ${s?.estimatedCredits ?? 30} credits`;
     $('face-scan-build').textContent = !this.meshy
-      ? 'Create 3D face'
+      ? 'Create full head'
       : c.ready
         ? `Rebuild with Meshy (${cost})`
         : this.job?.resumable
           ? 'Resume Meshy build (no new credits)'
-          : `Create 3D face with Meshy (${cost})`;
-    $('face-scan-load').textContent = this.meshy ? 'Load Meshy head' : 'Load face';
+          : `Create full head with Meshy (${cost})`;
+    $('face-scan-load').textContent = this.meshy ? 'Load Meshy head' : 'Load head';
     if (!this.meshy || !s || c.jobRunning) return;
     if (!s.configured) $('engine-meshy-settings').open = true;
     $('engine-meshy-state').textContent = s.error

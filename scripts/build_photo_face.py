@@ -1,13 +1,13 @@
 """Photographs -> recovered cameras -> fitted mesh -> photo texture -> rig cage."""
 
 from pathlib import Path
-import argparse, hashlib, json, sys, time
+import argparse, hashlib, json, os, sys, time
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np, trimesh
 from scipy.spatial import cKDTree, Delaunay
-from face_pipeline import atomic
+from face_pipeline import atomic, require_head_capture
 from head_artifacts import HeadArtifactTransaction, has_published_model
 from pipeline_timing import PipelineTimer
 from scripts.photo_cameras import recover
@@ -28,6 +28,7 @@ from scripts.template_selection import fit_selected_template
 from scripts.surface_evidence import surface_projection_error
 from scripts.eye_detail import scan_eyes, fit_eye_depth
 from scripts.predict_rear import predict
+from scripts.pipeline_failure import handle_api_limits
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -170,13 +171,15 @@ def _run(folder, use_astra, publication):
         )
 
     try:
+        manifest = json.loads((folder / 'capture.json').read_text())
+        evidence['includesHairCapture'] = manifest.get('captureRegion') == 'head'
+        require_head_capture(manifest)
         status('photos', 'Building your 3D face from saved photographs…')
         rec, info = recover(folder, status)
         evidence.update(info)
         status(
             'geometry', 'Triangulating facial measurements and checking reserved views…'
         )
-        manifest = json.loads((folder / 'capture.json').read_text())
         head_capture = manifest.get('captureRegion') == 'head'
         evidence['includesHairCapture'] = head_capture
         frames = {f['filename']: f for f in manifest['frames']}
@@ -237,6 +240,33 @@ def _run(folder, use_astra, publication):
         template_job = local_pool.submit(
             fit_selected_template, normalized, rec, frames, train
         )
+
+        def fit_hair():
+            surface, triangles, observed_count, fitted = template_job.result()
+            return fit_template_hair(
+                folder,
+                surface,
+                triangles,
+                observed_count,
+                rec,
+                frames,
+                texture_views,
+                center,
+                B,
+                transform,
+                fitted['earRegions'],
+            )
+
+        # Silhouette fitting depends on the cameras and template, not the AI
+        # answer. Work on its private vertex copy while the appearance calls
+        # run. If the answer says there is no hair, never consume this result
+        # (or its exception); the original template remains authoritative.
+        # The serial switch is for output-equivalence and timing comparisons.
+        hair_job = (
+            local_pool.submit(fit_hair)
+            if head_capture and os.environ.get('CONTACT_PARALLEL_LOCAL') != '0'
+            else None
+        )
         advice = None
         if use_astra:
             status(
@@ -283,6 +313,9 @@ def _run(folder, use_astra, publication):
         }
         status('surface', 'Fitting the smooth full-head template to the measured face…')
         p, f, face_count, template_info = template_job.result()
+        # A bald-head answer can proceed while the unused hair fit finishes.
+        # Keep its template inputs isolated from all later surface mutations.
+        p, f = p.copy(), f.copy()
         evidence['templateFit'] = template_info
         semantics = None
         if advice and head_capture:
@@ -322,19 +355,7 @@ def _run(folder, use_astra, publication):
                 'hair',
                 'Fitting the head and hair envelope to the captured silhouettes…',
             )
-            p, hair = fit_template_hair(
-                folder,
-                p,
-                f,
-                face_count,
-                rec,
-                frames,
-                texture_views,
-                center,
-                B,
-                transform,
-                template_info['earRegions'],
-            )
+            p, hair = hair_job.result() if hair_job else fit_hair()
             evidence['hair'] = hair
         if advice:
             p, evidence['headCompletion'] = apply_shape_prior(
@@ -508,8 +529,8 @@ def _run(folder, use_astra, publication):
                 )
                 if head_capture
                 else (
-                    'Gray rear head is estimated. Hair, ears, glasses geometry '
-                    'and hidden surfaces were not fully captured.'
+                    'Full head with estimated rear geometry and material. '
+                    'Hair, ears and hidden surfaces were not fully captured.'
                 )
             ),
         }
@@ -623,5 +644,6 @@ if __name__ == '__main__':
         from contextlib import nullcontext
 
         trace = nullcontext()
-    with trace:
-        run(args.folder.resolve(), not args.local_only)
+    with handle_api_limits():
+        with trace:
+            run(args.folder.resolve(), not args.local_only)

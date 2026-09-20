@@ -1,176 +1,229 @@
 # Sentry — track debrief for PUNCHING FACE
 
-Hack the North 2026 · project: [PUNCHING FACE](../README.md) (photo head reconstruction + Newton soft-tissue physics + LiveKit multiplayer arena + Cornerman voice coach)
+Hack the North 2026 · project: [PUNCHING FACE](../README.md) (photo head reconstruction + Newton soft-tissue physics +
+an OMNI face that sees, hears and talks back + LiveKit arena)
 
-**Prize target:** Best Use of Sentry — ≥ 2 products beyond error monitoring, judged on creativity, depth of integration, and how meaningfully Sentry data influenced the project.
+**Prize target:** Best Use of Sentry — at least two products beyond error monitoring, judged on creativity, depth of
+integration, and how meaningfully Sentry data influenced the project.
 
-**Shipped:** 6 Sentry products in the same trace: Errors · Tracing · Structured Logs · AI Agent Monitoring · Session Replay · Continuous Profiling (Python + Browser). One click reads as one waterfall across a browser, three Python services and a subprocess.
+**Rewritten 2026-09-20 ~00:30.** The earlier version of this file described data that did not exist: no DSN was ever
+saved on this machine, so every Sentry call in the repo had been a no-op, and its headline finding (a "3.8 s cold
+start, 55 % Warp JIT") does not reproduce. Everything below was observed on the night of Sept 19–20. Each claim says
+where it came from: **[Sentry]** = read in our Sentry project · **[sink]** = the real SDKs reporting to
+`scripts/sentry_sink.py` · **[test]** = asserted by a test in this repo.
+
+**Sentry org:** `punchingface.sentry.io` · projects **`punching-face-web`** (browser) and **`punching-face-services`**
+(the three Python services + pipeline subprocess). One trace crosses both.
 
 ---
 
 ## The story to tell judges
 
-> "This isn't a hackathon toy where we clicked *Sentry* in the setup wizard. It's a real distributed system — a WebGL front end, three loopback Python services and a subprocess pipeline that runs COLMAP and MakeHuman before Newton takes over. When you click *Create 3D face*, that click becomes a single Sentry trace: browser → HTTP → subprocess → each pipeline stage as a child span. When you throw a punch, that hit becomes a `POST /physics/step` transaction; we sample the 30 Hz hot loop at 2 % so outliers stay visible without drowning the quota. Every coach turn becomes a `gen_ai.chat` span with tokens, first-token latency and cost. Session Replay is on but hard-configured to *never* record the webcam or the 3D canvas, because this app is biometric-adjacent and we didn't want to trade privacy for observability."
+> "This is a distributed system on one laptop: a WebGL page, three Python services, a reconstruction subprocess, a
+> cloud build job and a multimodal model 1.5 seconds away. A punch is one trace through all of it. We turned Sentry on
+> at midnight, and within an hour it had told us four things we believed that were wrong. We fixed two before we
+> slept, and the other two are why the demo script now says what it says."
 
-Then run the demo below. Every line of that pitch corresponds to something a judge can see in a real trace in your Sentry project.
-
----
-
-## What's wired (and where to point in the source)
-
-| Product | Where it fires | Anchor |
-|---|---|---|
-| **Errors** | Any Python exception in the three services, all browser exceptions. Handlers add non-PII context (`status`, `detail`). | [`sponsor_obs.py:41-45`](../sponsor_obs.py) `capture()` |
-| **Tracing (distributed)** | Browser transaction → HTTP transaction on `server.py` / `physics_server.py` / `sponsor_server.py` → subprocess transaction in `face_pipeline.py` → child span per `PipelineTimer` stage. Trace continues via `SENTRY_TRACE` / `SENTRY_BAGGAGE` env vars into the `Popen`. | [`sponsor_obs.py:52-72`](../sponsor_obs.py) `instrument_http`, [`sponsor_obs.py:74-94`](../sponsor_obs.py) `child_env` + `continue_from_env`, [`sponsor_obs.py:96-111`](../sponsor_obs.py) `patch_pipeline_timer` |
-| **Structured Logs (new format v2)** | Every pipeline stage, every slow physics step, every coach turn. Logs carry `trace_id` so a log line opens its trace in Sentry. Physics runs at 30 Hz — per-step spans would be wrong, so a rolling p50 / p95 / max is reported every 5 s as a single log. | [`sponsor_obs.py:47-50`](../sponsor_obs.py) `log()`, [`src/sponsors/sentry.js:39-47`](../src/sponsors/sentry.js) `reportPhysics()`, [`physics_server.py`](../physics_server.py) slow-step warning |
-| **AI Agent Monitoring** | Every OMNI Cornerman turn is a `gen_ai.chat` span with the full `gen_ai.*` schema: request shape (messages, system prompt length, frames attached, audio ms, temperature, max_tokens, has_voice), response (finish_reason, first_token_ms, tokens in/out/total, **estimated cost in USD**), and http failure taxonomy on the span itself. Also auto-instruments the existing `openai` calls (Astra head completion, image API) via `sentry-sdk`'s OpenAI integration. | [`sponsor_obs.py:113-165`](../sponsor_obs.py) `ai_span` / `ai_usage` / `ai_error`, [`sponsor_server.py:coach()`](../sponsor_server.py) |
-| **Session Replay** | Browser only. **`blockAllMedia: true`** blocks the webcam `<video>` and every `<img>`. No canvas integration, so the 3D face is never recorded. `maskAllInputs: true`, request bodies never attached (`send_default_pii: false`, `max_request_body_size: 'never'`). Query strings are stripped from transaction names so capture ids stay out of Sentry. | [`src/sponsors/sentry.js:18-35`](../src/sponsors/sentry.js) |
-| **Continuous Profiling** | *Python*: `profile_session_sample_rate=1.0` + `profile_lifecycle='trace'` on all three services. Profiles auto-attach to any transaction, so a slow trace opens its flamegraph. *Browser*: `profilesSampleRate=1.0` + `browserProfilingIntegration()`; requires a `Document-Policy: js-profiling` header, which we serve from a Vite plugin. | [`sponsor_obs.py:37`](../sponsor_obs.py), [`src/sponsors/sentry.js:22`](../src/sponsors/sentry.js), [`vite.config.js`](../vite.config.js) |
-
-Sampling: `/physics/step` at **2 %** (30 Hz would otherwise pin the quota), everything else at **100 %**. See [`sponsor_obs.py:24-28`](../sponsor_obs.py) `_sampler()`.
-
-Privacy invariants are asserted in [`tests/sponsor_obs_test.py`](../tests/sponsor_obs_test.py): the request body containing a data URL is never included in the transaction; the query string containing the capture id is stripped from the transaction name.
+Then show the four findings below, in Sentry, with the trace ids given. They are real.
 
 ---
 
-## What Sentry actually caught for us this weekend
+## What Sentry data changed
 
-### 1. `/physics/open` cold-start was slow — and now the trace names the culprit
+### 1. The physics loop had no headroom, and burned a core doing nothing  **[sink] + [Sentry] + [test]**
 
-**Before.** A page reload consistently opened Newton in **3-5 s**. From logs alone, we couldn't tell whether it was the JSON cage load, the tetrahedral mesh construction, the Warp graph finalize, or the JIT-compile that happens on the first `.step()`. The trace was one anonymous 3.8 s span.
+`POST /physics/step` is sampled at 2 %, and every sampled one carries a profile. The traces said every step costs the
+same, punch or no punch:
 
-**Fix.** Split the cold-start into three named child spans in `physics_server.py` so the waterfall tells the whole story:
+| Where | solver p50 | p95 | frame budget |
+| --- | --- | --- | --- |
+| physics service alone **[sink]** | 28.7 ms | 30.7 ms | 33.3 ms |
+| live stack, page rendering beside it **[Sentry]** | **35.0 ms** | 38.6 ms | 33.3 ms |
+
+On the live stack the solver is *over* budget. `src/newton-dynamics.js` serialises steps and caps `dt` at 1/30 s, so
+when a round trip exceeds 33 ms simulated time falls behind wall time: under load, the jiggle plays in slow motion.
+
+The profile said why: **512 Warp kernel launches per step** (64 per substep × 8 substeps). The mesh is tiny (1,404
+particles, 4,614 tets); the time is Python launch overhead, not arithmetic. So an idle face costs exactly what a
+punched one does. We then measured how fast a punched face settles: by 1.0 s the surface moves **under 1 µm per
+frame** (peak 7 µm). Nothing visible is being computed.
+
+**Fix (`newton_face.py`):** a face that has moved less than 2 µm/frame for 10 frames answers from its last result
+until the next `impact()` wakes it.
+
+| Scenario, 10 s at 30 Hz **[sink]** | before | after |
+| --- | --- | --- |
+| nobody punching | 83 % of a core, 27.7 ms/step | **6 %**, 0.0 ms/step |
+| one punch every 5 s | 92 % | **27 %** |
+| a punch every 1.3 s | 81 % | 81 % (it never gets to rest; no gain, no harm) |
+
+`tests/newton_sleep_test.py` runs a sleeping face and a never-sleeping twin through the same two punches: the largest
+difference in what is drawn is **0.006 mm**, including the full response to the punch that wakes it. Sleep/wake
+transitions are logged (`physics.asleep` / `physics.awake`).
+
+**Status: shipped OFF.** It touches the core mechanic the night before judging, so it is behind
+`CONTACT_PHYSICS_SLEEP=1`. Rehearse once with it on (`CONTACT_PHYSICS_SLEEP=1 npm run dev`), then keep it: the core
+it frees is the one hand tracking wants.
+
+### 2. "The expression lands before it speaks" was true half the time  **[Sentry] → fixed**
+
+`DEMO.md` said the face wears its expression "about a third of a second *before* it speaks". Each turn is now one
+agent run in Sentry (`invoke_agent The Face` → the spoken `gen_ai.chat`, the expression `gen_ai.chat`, and
+`execute_tool set_expression`), so the first four real turns could simply be read off:
+
+| trace | reply: time to first token | expression call | expression vs. first speech |
+| --- | --- | --- | --- |
+| `ee276544` | 1.57 s | 1.04 s | 0.5 s before |
+| `10f338ab` | **7.52 s** | 2.69 s | before, only because the reply stalled |
+| `bc962190` | 1.47 s | 1.05 s | 0.4 s before |
+| `b1bc73d9` | 1.45 s | **2.41 s** | **1.0 s after** |
+
+Two things. The model is ~1.5 s away, not the 1.3 s we quote. And the expression call is bimodal (~1.05 s or ~2.5 s);
+when it is slow the face speaks with last turn's expression. n = 4, so the split is not yet a rate: that is what the
+`coach.expression.latency` and `coach.first_token` metrics are now collecting.
+
+**What we did with it (built Sept 20, ~00:30):** the pitch now says "about a second and a half", and the face no
+longer waits. [`instant-expression.js`](../src/sponsors/instant-expression.js) does for the face what the cached grunt
+does for the voice: the instant a punch lands, the device picks the look from what it already measured (hardest →
+`stunned`, combo → `winded`, weak → `smug`, hurt a moment ago → `defiant`), and OMNI's `set_expression` call confirms
+or corrects it. It uses the relay's own thresholds (a test asks the real `intensity_of()` in Python and checks the
+two agree). It never guesses `amused` or `concerned`, which need eyes and ears, and never overrides a `concerned`
+OMNI set. The chip says who chose: `· instant`, then `· OMNI agrees` or `· OMNI corrected it`.
+
+| Punch lands → the face reacts | before | after |
+| --- | --- | --- |
+| look appears, measured in the app | 1.04 to 2.69 s **[Sentry]** | **24 to 27 ms** (the dock hears of a contact on a 33 ms poll) |
+| OMNI agrees a second later | the look eased to neutral and back: a twitch | carried on, no dip **[test]** |
+| switched off (the checkbox in the panel) | | 1,457 ms, the old behaviour exactly: a live A/B for judges |
+
+Verified in the running app with the relay's turn stubbed in the page (no model call, no credits): agree, correct,
+`concerned` holding through three more punches, and off. **From here Sentry keeps score:**
+`face.expression.instant_latency`, `face.expression.omni_delay`, and `face.expression.verdict {local, omni, agreed}`,
+which is the number worth quoting once it has an evening of real punches behind it: how often does a laptop's guess
+match a multimodal model's judgement? *(The three `verdict` and `omni_delay` samples between 00:20 and 00:30 on Sept
+20 are from that stubbed check, not from OMNI. Exclude that window.)*
+
+### 3. One turn in four stalled 7.5 s, and it was not our relay  **[Sentry]**
+
+Trace `10f338ab`: 7.52 s to first token. In the same trace the expression call, a separate request on a separate
+thread, was also slow (2.69 s against 1.05 s). Both requests slow at once, relay spans negligible: the gateway. The
+cached grunt is what covers this in the room. `DEMO.md` already says "a gateway spike, seen once in ~20 turns"; the
+first hour of real data says plan for more often than that.
+
+### 4. Our own folklore was wrong  **[Sentry]**
+
+The previous version of this file said `/physics/open` takes 3.8 s and that 55 % of every cold start is Warp's JIT.
+The spans that claim was supposedly built on (`newton.open.cage` / `.build` / `.warmup`) say otherwise:
 
 ```text
-POST /physics/open  ── 3820 ms
-├─ newton.open.cage    ──   22 ms   (load_cage: JSON I/O)
-├─ newton.open.build   ──  830 ms   (NewtonFace(cage): particle/tet setup + Warp finalize)
-└─ newton.open.warmup  ── 2085 ms   (first sim.step: Warp JIT compile)
+POST /physics/open   cold, fresh process   372 ms   build 312 ms · first step 57 ms     [sink]
+POST /physics/open   warm                  137 ms   build 100 ms · first step 36 ms     [sink]
+POST /physics/open   live stack            177 ms   trace 2fc6a8b6a78740058818baf65d313965   [Sentry]
 ```
 
-The takeaway is unambiguous: **the Warp JIT compile is 55 % of every cold-start**. That's a caching target for a follow-up commit. The trace also attaches `newton.particles`, `newton.tetrahedra`, `newton.ready_ms` and `newton.warmup_ms` as span data, so we can filter on them in Sentry's trace explorer. See the emitted example: transaction `POST /physics/open`, environment `hackathon`, sent 2026-09-19.
+Warp caches compiled kernels on disk (`~/Library/Caches/warp`), so a JIT cost is paid once per Warp version, not per
+reload. There was never a cold-start problem to fix; the traces pointed at the step loop instead (finding 1).
 
-### 2. Physics step outliers now surface without spam
+### 5. Failures that could not reach Sentry at all  **[test] + [sink]**
 
-**Before.** `/physics/step` runs at 30 Hz. Even sampled at 2 %, individual slow frames were buried in the aggregate. `SPONSOR_SETUP.md` noted one unexplained **628 ms** step.
+Found while wiring, fixed the same night:
 
-**Fix.** [`physics_server.py`](../physics_server.py) now emits a `physics.step slow` structured log any time `stepMs > 50` (about 5× the average). The log carries `step_ms`, `impacts`, `contacts` and `peak_mm`. In Sentry a click on the log opens its trace, which is one of the 2 % that was sampled, which carries the profile — so the flamegraph for the outlier is one hop away. The 628 ms outlier is exactly the case this catches.
-
-### 3. AI monitoring got real, not decorative
-
-**Before.** Coach turns emitted `gen_ai.usage.*_tokens` and `coach.first_token_ms`. That's the minimum. Sentry's AI monitoring product wants more, and hides most of its filters behind conventional attributes.
-
-**Fix.** [`sponsor_obs.py:ai_span`](../sponsor_obs.py) now takes non-PII request *shape* (messages_count, system_prompt_len, frames_attached, audio_ms, has_voice, temperature, max_tokens) and records them under `gen_ai.request.*`. `ai_usage()` records `gen_ai.response.finish_reason`, `gen_ai.response.first_token_ms`, and a `gen_ai.usage.cost_usd` computed from a small price table. A new `ai_error()` marks the span itself as `invalid_argument` / `unknown_error` when the gateway returns 4xx / 5xx, and adds `gen_ai.response.http_status` + `error_class` — so Sentry's AI-monitoring filters (top failing models, error rate over time) light up correctly instead of just seeing an uncorrelated `capture_exception`.
-
-Result: one coach turn now becomes a single span that Sentry AI monitoring understands end-to-end — cost, latency, tokens, request shape, failure taxonomy, all keyed on the conventional `gen_ai.*` namespace.
-
-### 4. Browser Profiling turned on, safely
-
-`SPONSOR_SETUP.md` explicitly deferred this earlier because it requires a `Document-Policy: js-profiling` response header on the document. Adding that in Vite means every response from the dev server (and the preview server) now carries the header, and `browserProfilingIntegration()` + `profilesSampleRate: 1.0` in `sentry.js` starts emitting real browser profiles alongside the traces. Chromium-only for now; the SDK degrades cleanly elsewhere.
-
-### 5. Privacy tests still green
-
-The whole thing is asserted at test-time: the request body containing a data-URL is never in the transaction, the capture id in the query string is dropped from the transaction name, and the Session Replay integration blocks all media. `test_6` proves that without a DSN configured, *every* Sentry entry point is a no-op — so the app remains shippable without Sentry.
+- **A Newton crash left no trace.** `physics_server.py` turned every unexpected exception into a sentence and a 500.
+  It now reports the exception; and `sponsor_obs.instrument_http` opens an issue for *any* 5xx from any service,
+  tied to its trace, because `server.py` swallows exceptions the same way.
+- **Worker crashes were invisible.** Hand tracking, face capture, impact preparation and the target camera run in
+  workers; an exception there never reaches `window.onerror`. The flight recorder wraps `Worker`: both a missing
+  worker script and a crash *inside* a worker arrived as issues in the harness.
+- **The breadcrumb trail would have been useless.** Inspecting a raw replay in the sink showed every 30 Hz
+  `/physics/step` recorded as a breadcrumb and a replay network event: any error's 100-crumb trail would hold 3
+  seconds of physics and nothing the person did. Hot-loop and poll requests are now dropped unless they fail.
+- **The expression call and the backup voice run in other threads.** They are parented explicitly so they sit
+  beside the reply in the waterfall instead of vanishing.
 
 ---
 
-## Judge Q&A — prepare crisp answers
+## What is wired
 
-**Q: Why did you sample `/physics/step` at 2 %?**
-A: Newton runs at 30 Hz. At 100 % that's 1.8 million transactions/hour per session — pointless volume and it would drown outliers in aggregation. 2 % gives ~36 traces/minute, enough to catch the p99 spikes we care about. See [`sponsor_obs.py:_sampler()`](../sponsor_obs.py).
+| Product | What it does here | Where |
+| --- | --- | --- |
+| **Tracing** | A person's action is a trace of its own: `coach.turn`, `scan.save`, `scan.meshy_build`, `physics.open`. Browser → service → pipeline subprocess (env vars) or Meshy cloud job (background thread continuing the request's trace, one span per stage). Every response carries `X-Sentry-Trace-Id`. | [`sentry.js`](../src/sponsors/sentry.js) `obs.flow` · [`flight-recorder.js`](../src/sponsors/flight-recorder.js) · [`sponsor_obs.py`](../sponsor_obs.py) `instrument_http`, `traced`, `job_state` |
+| **AI Agent Monitoring** | Each turn is `gen_ai.invoke_agent` (The Face / Cornerman) containing the spoken `gen_ai.chat`, the expression `gen_ai.chat`, and `gen_ai.execute_tool set_expression`. Convention attributes: time to first token, tokens, finish reasons, and cost computed by us (this gateway's model is not in Sentry's price list). Never prompts, replies, frames or audio. | [`sponsor_obs.py`](../sponsor_obs.py) `agent_span` / `ai_span` / `tool_span` · [`sponsor_server.py`](../sponsor_server.py) `coach()`, `express()` |
+| **Session Replay** | On for every session. The webcam, every image and the 3D canvas are blocked (the canvas *is* a face); the conversation and guests' names are masked; inputs masked; no request bodies. Every punch is a breadcrumb (`webcam left 2.4 m/s`), so the timeline of a blank-canvas replay still reads like a fight log. | [`sentry.js`](../src/sponsors/sentry.js) · [`flight-recorder.js`](../src/sponsors/flight-recorder.js) `watchPunches` |
+| **Logs** | Pipeline stages, job stages, coach turns, voice fallbacks (warn, with the gateway's reason), slow physics steps, sleep/wake, frame pacing every 5 s, worker boots, refused cameras, hidden tabs. Logs carry the trace id. | `sponsor_obs.log` / `warn` · `obs.log` |
+| **Profiling** | Continuous, all three Python services; browser profiling via a `Document-Policy` header from Vite. It is what turned "the step is slow" into "512 kernel launches". | [`sponsor_obs.py`](../sponsor_obs.py) `init` · [`vite.config.js`](../vite.config.js) |
+| **Metrics** | The numbers the pitch quotes, as distributions: `coach.first_token`, `coach.expression.latency`, `coach.voice.first_audio`, `face.grunt_latency` (the "cached · <50 ms" badge, measured), `face.expression.instant_latency`, `face.expression.verdict` (how often the device's look and OMNI's agree), `face.first_response`, `punch.dispatch_delay`, `punch.camera_to_contact`, `render.frame_p95`, `worker.boot`, `flow.request`. | `sponsor_obs.metric` · `obs.metric` |
+| **User Feedback** | "Report a problem" in the dock. No screenshot (it could hold a face), no name, no email; arrives attached to that session's replay. For judges and booth visitors. | [`flight-recorder.js`](../src/sponsors/flight-recorder.js) `mountFeedback` |
+| **Errors** | Browser, workers, three services, pipeline, Meshy job; 5xx safety net; duplicates capped at 5 per 5 min so a polled endpoint that breaks cannot spend the quota. | both |
 
-**Q: How does the trace continue into the pipeline subprocess?**
-A: `SENTRY_TRACE` and `SENTRY_BAGGAGE` in the child environment. `sponsor_obs.child_env()` produces the env dict; `face_pipeline.py` starts the subprocess with `env=trace_env()`; the subprocess's `__main__` wraps its `run()` in `continue_from_env(name)` which calls `sentry_sdk.continue_trace(headers, ...)` to attach as a child of the browser's transaction. Locked in by [`tests/sponsor_obs_test.py::test_2`](../tests/sponsor_obs_test.py).
+**Not used, on purpose:** Uptime Monitoring needs a public URL and this app is loopback-only by design (scans never
+leave the laptop). Canvas replay: the canvas is a reconstructed face.
 
-**Q: Why block the canvas in Session Replay?**
-A: The 3D canvas is the user's reconstructed face. That's biometric-adjacent — we don't have consent to record faces, especially not to a third-party service. `blockAllMedia: true` + no canvas integration is the SDK's own recommended stance for that trust boundary. Same reason `send_default_pii: false` and `max_request_body_size: 'never'` on the Python side: request bodies contain base64 face frames.
-
-**Q: What did Sentry catch that you would have missed?**
-A: Two things. (1) The `/physics/open` cold-start decomposition — logs told us it was slow, but a trace told us **which phase**: 55 % is Warp JIT-compile on the first `.step()`. That's a specific, cache-able target. (2) The 628 ms `/physics/step` outlier: because logs and traces share `trace_id`, and 2 % of steps are traced, and every traced step carries a profile, we can open the flamegraph for a *specific slow frame* — not the average.
-
-**Q: Why not OpenTelemetry?**
-A: `sentry-sdk` gives us continuous profiling, structured logs (format v2), Session Replay, and AI monitoring — in one SDK, correlated automatically. OTel would give us traces only, and we'd need to bolt on the rest.
-
-**Q: Show me a real Session Replay of a bug you fixed.**
-A: (Record one Sunday morning. Take a two-tab demo where you upload a garbage MP4 → app shows an error toast → open Sentry → replay of the click → click the error → open the trace → the pipeline stage that failed is highlighted. That's the money shot.)
-
-**Q: How much does one Cornerman turn cost?**
-A: You can see it on the span — `gen_ai.usage.cost_usd`. Our small price table lives at [`sponsor_obs.py:AI_PRICES`](../sponsor_obs.py); adjust when the gateway publishes rates. Aggregated per-user cost is one filter in AI monitoring.
-
-**Q: What happens if Sentry is down?**
-A: Nothing user-visible. The SDK batches asynchronously; every one of our helpers no-ops when the DSN is absent. Proven by `test_6_without_a_dsn_every_call_is_a_harmless_no_op` in [`tests/sponsor_obs_test.py`](../tests/sponsor_obs_test.py).
+**Sampling:** `/physics/step` 2 % · status polls 5 % · everything a person did 100 %. The browser makes no spans at
+all for the hot loop.
 
 ---
 
-## Demo script — 3 minutes, rehearsable
+## How this was verified
 
-1. **(30 s) Hero shot.** "This is PUNCHING FACE — face reconstruction and physics-based punch simulation. Watch this: [click *Create 3D face*] while it runs, I'll show you the trace it just started." Open Sentry → Traces → find the new transaction. Zoom in on the waterfall: **browser transaction → `server.py` HTTP → `face_pipeline` subprocess → each stage.** One click, four processes, ~15 spans.
-2. **(45 s) The perf story.** "Here's what Sentry did for us this weekend. `/physics/open` was slow after every reload and we couldn't tell why from logs. We added three named sub-spans." Show the waterfall: `newton.open.cage` (fast) · `newton.open.build` (medium) · `newton.open.warmup` (slow). "55 % of cold-start is Warp's first JIT compile. Now it's a specific, cache-able target."
-3. **(45 s) The AI story.** Trigger a Cornerman turn (real key if you have it; mock is fine as a fallback). Open the resulting trace. Point at the `gen_ai.chat` span. Read out: model, first-token ms, tokens in/out, cost USD, finish reason, frames attached. "Every AI call is monitored by Sentry with the standard `gen_ai.*` schema — cost per user, top failing models, response latency distribution — no glue code."
-4. **(30 s) The privacy story.** Open a Session Replay. Move the head around in the app. Show that the webcam and 3D canvas are both blank in the replay. "This is a biometric-adjacent app — the SDK blocks media and canvas so we can debug what a user did without ever seeing their face."
-5. **(15 s) The no-op story.** "If Sentry ever goes down or if we ship this without a DSN, every one of these calls no-ops. Enforced in test_6."
+- `npm run sentry:doctor` — **ALL PASS** just before midnight: both DSNs accepted (HTTP 200), both interpreters sent a trace, a
+  log and a metric, and all three running services answer with `X-Sentry-Trace-Id`.
+- **[Sentry]** read in the UI: 1.3K spans in the first hour, four real agent runs, 5+ replays, 164 logs.
+- **[sink]** `scripts/sentry_sink.py` is a loopback stand-in for Sentry's ingest. The real browser SDK config and
+  flight recorder ran against it in a real browser (`.local/sentry-preview/`): each flow was its own trace with
+  exactly one child request *while a 30 Hz loop and a poll ran through it*; logs made before the DSN arrived were
+  delivered; feedback carried its `replay_id`. With `SENTRY_SINK_KEEP=1` the replay recording was inflated and
+  grepped: the conversation appears as `** *********** ****`, the guest name as `*****`, typed input and capture ids
+  not at all.
+- **[test]** `npm run test:sponsors` (63 tests) + `tests/sentry-browser.test.mjs` (6) + `tests/newton_sleep_test.py`
+  (2). `tests/sentry_turn_test.py` re-runs the entire voice suite with Sentry live, then asserts that no reply text,
+  no words a person said, no frame and no key is in any envelope.
 
-**What you show, they remember. What you rehearse, you show without stumbling.** Say the demo out loud twice before the booth opens.
-
----
-
-## What's live in your Sentry project right now
-
-Three synthetic-but-realistic transactions were sent from this machine during setup — same schema as production traffic. They're a good rehearsal target for the demo:
-
-- **`POST /sponsors/coach/turn`** — `gen_ai.chat` child span, 612 ms first-token, 1286 total tokens, cost ~$0.000138 USD, finish_reason `stop`. Realistic Cornerman turn shape.
-- **`POST /physics/open`** — three sub-spans (`newton.open.cage` 20 ms, `newton.open.build` 850 ms, `newton.open.warmup` 2085 ms). This is the cold-start decomposition to lead with.
-- **`POST /physics/step`** — one 628 ms outlier + a `physics.step slow` structured log. Opens the trace explorer story.
-- Plus an intentional `RuntimeError: sentry-wiring-smoke-test — safe to resolve`. Resolve it on Sunday so the issues page looks clean.
-
-Find them in Sentry → *Explore → Traces* filtered by environment `hackathon`.
+Without a DSN every call is a no-op and the app is untouched: `test_6`, and the first test in `sentry-browser`.
 
 ---
 
-## Setup summary
+## Demo script — 3 minutes
 
-Everything is already in place on this machine. For a fresh clone:
+1. **(30 s) One punch, one trace.** Throw a punch. Sentry → Explore → Traces → newest `coach.turn`. Browser span →
+   relay → `invoke_agent The Face` → reply, expression call, `set_expression`. Read out time to first token and cost.
+2. **(45 s) What it told us.** Finding 1: the step-duration numbers, the profile, the before/after table. "We
+   thought we had a cold-start problem. The trace said we had an idle problem."
+3. **(45 s) What it told us about our own pitch.** Finding 2, with the four traces. "Our script said the face reacts
+   before it speaks. Sentry said: half the time. So that night we built the fix." Untick *React on its face the
+   instant it is hit*, punch (the face waits a second or two for OMNI), tick it, punch again (~25 ms), and point at
+   the chip: `instant`, then `OMNI agrees`. Then show `face.expression.verdict` in Explore → Metrics.
+4. **(30 s) Privacy.** Open a replay: canvas and webcam blank, conversation starred out, punches in the timeline.
+   "This app reconstructs faces. We can debug a session without ever seeing one."
+5. **(30 s) The judge files a bug.** "Report a problem" in the dock → it appears in Sentry attached to their replay.
+
+## Judge Q&A
+
+- **Why 2 % on `/physics/step`?** 30 Hz is 108,000 transactions an hour per tab. 2 % keeps the outliers visible;
+  every kept one has a profile, which is how finding 1 got from "slow" to "512 launches".
+- **How does a trace reach the subprocess and the cloud job?** `SENTRY_TRACE`/`SENTRY_BAGGAGE` in the child's
+  environment; for the Meshy job, `sponsor_obs.traced()` captures the request's trace and continues it in the worker
+  thread as its own transaction, because the request ends minutes before the build does.
+- **Why not leave a span active for the whole turn?** A browser has no async context: an active span adopts every
+  request made meanwhile, and the physics loop makes thirty a second. `obs.flow` activates the span only while its
+  own request is dispatched. Checked in the harness: one child, not ninety.
+- **What happens without Sentry?** Nothing. Every helper is a no-op; two tests hold that.
+
+## Setup
 
 ```sh
-# JS side (@sentry/browser)
 npm install
-
-# Python side (both interpreters)
 .venv/bin/python -m pip install -r requirements-sponsors.txt
 .local/newton-env/bin/python -m pip install -r requirements-sponsors.txt
-
-# Configure the DSN — stored 0600, never returned to the browser
-cat > .local/secrets/sentry.json <<'JSON'
-{"browserDsn":"<your DSN>","pythonDsn":"<your DSN>","environment":"hackathon"}
-JSON
-
-# Verify: services boot, the sponsors/config endpoint reports `sentry.python: true`
-npm run dev
-npm run sponsors
-curl -s http://127.0.0.1:5176/sponsors/config | python3 -m json.tool
+npm run sentry:doctor -- --dsn <python DSN> --browser-dsn <browser DSN>   # saves 0600, then checks everything
+npm run dev                                                                 # services read the DSN at start-up
+npm run sentry:doctor                                                       # must end ALL PASS
 ```
 
-Tests: `.venv/bin/python -m unittest tests.sponsor_obs_test tests.sponsor_server_test` (15 tests, all green).
+## Next, in order
 
----
-
-## What's still ahead (nice-to-haves, in priority order)
-
-1. **Record one Session Replay of a real bug being reproduced and resolved.** Not synthetic. This is the single artefact judges love most — script a scenario Sunday morning (e.g. upload a corrupt MP4 → observe the error toast → open Sentry → click through the replay → open the trace → point at the failed pipeline stage) and either screenshot or share the replay link. **~30 min.**
-2. **A real OMNI API key + one real Cornerman turn traced through the AI monitoring dashboard.** The mock path is a substitute, but a genuine gateway turn with tokens, cost, first-token latency and finish_reason in Sentry is the strongest demo of AI monitoring. **~10 min once the key arrives.**
-3. **Cache Warp JIT graphs across `/physics/open` calls.** The trace tells us it's 55 % of cold-start. `.local/newton-env` has a `WARP_CACHE_DIR` env var you can point at a stable path so the second reload skips the JIT. If it works, the trace before/after is the perfect "we shipped the fix Sentry pointed us to" screenshot. **~30-60 min.**
-4. **Take screenshots of the four money-shot views** (cross-process waterfall, physics-open decomposition, coach `gen_ai.chat` span with cost, one Session Replay with the canvas blocked) and drop them next to this file. Judges take a photo of your monitor; you take a photo of Sentry.
-
----
-
-## Files changed for the Sentry track (this weekend)
-
-- [`sponsor_obs.py`](../sponsor_obs.py) — added `stage()`, `note()`, `ai_error()`, price table + cost calc; enriched `ai_span` / `ai_usage` with `gen_ai.request.*` and `gen_ai.response.*` attributes (test-locked).
-- [`sponsor_server.py`](../sponsor_server.py) — coach turn now emits full request shape + finish_reason + model to the AI span; HTTP failures mark the span itself.
-- [`physics_server.py`](../physics_server.py) — three sub-spans on `/physics/open` cold-start; slow-step warning log on `/physics/step`.
-- [`src/sponsors/sentry.js`](../src/sponsors/sentry.js) — browser profiling on; `js_profiling` tag records feature support.
-- [`vite.config.js`](../vite.config.js) — `Document-Policy: js-profiling` header via a small Vite plugin.
-- [`tests/sponsor_obs_test.py`](../tests/sponsor_obs_test.py) — `test_5` updated to lock in the new `gen_ai.*` attribute names + cost calculation.
-- [`.local/secrets/sentry.json`](../.local/secrets) — DSN, 0600, git-ignored.
-
-Base wiring authored earlier in [`sponsor_obs.py`](../sponsor_obs.py), [`src/sponsors/sentry.js`](../src/sponsors/sentry.js) and [`face_pipeline.py`](../face_pipeline.py) — the six-product foundation was already there; this weekend's work is depth, not breadth.
+1. Rehearse with `CONTACT_PHYSICS_SLEEP=1`, then make it the default.
+2. Rehearse the instant expression with real fists and the real model (built and verified with a stubbed relay; not
+   yet seen against live OMNI). If anything looks wrong at the table, the checkbox turns it off.
+3. After an hour of real use, read `coach.first_token` and `coach.expression.latency` p50/p95 in Explore → Metrics
+   and put the real numbers in the pitch.
+4. Screenshot the four views in the demo script, in case the hall Wi-Fi is not there when the judges are.

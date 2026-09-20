@@ -248,7 +248,7 @@ export class NewtonFaceDynamics extends FaceDynamics {
 
   step(dt) {
     this.impactRig.step(dt);
-    this.speechRig.step(dt, this.speechDuck);
+    this.speechRig.step(dt, this.speechDuck, this.impactRig.gasp);
     const rigKey = JSON.stringify(this.rig) + ':' + this.softness;
     if (rigKey !== this.lastPose) {
       this.lastPose = rigKey;
@@ -303,8 +303,10 @@ export class NewtonFaceDynamics extends FaceDynamics {
                 : 'cheeks';
       this.regionPeaks[region] = Math.max(this.regionPeaks[region], d);
     }
+    // As in FaceDynamics.step: the spring rests where the pain rig turns the head.
     this.recoilVelocity
       .addScaledVector(this.recoil, -40 * dt)
+      .addScaledVector(this.impactRig.headPose, 40 * dt)
       .multiplyScalar(Math.exp(-9 * dt));
     this.recoil.addScaledVector(this.recoilVelocity, dt);
     this.geometry.attributes.position.needsUpdate = true;

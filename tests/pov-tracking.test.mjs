@@ -74,7 +74,7 @@ test('arm mask keeps skin and sleeve on the landmark-seeded arm but rejects anot
   assert.equal(alpha[25 * width + 3], 0, 'unseeded person blob rejected');
 });
 
-test('a fist the segmenter misses entirely keeps a dimmer landmark-backed core', () => {
+test('a fist without segmented skin cannot expose the camera background', () => {
   const width = 32,
     height = 32,
     landmarks = hand(0.5, 0.28, 0.12);
@@ -82,22 +82,19 @@ test('a fist the segmenter misses entirely keeps a dimmer landmark-backed core',
     landmarks,
   ]);
   assert.ok(
-    alpha[9 * width + 16] > 0 && alpha[9 * width + 16] < 255,
-    'fist core survives at partial alpha',
+    alpha.every((value) => value === 0),
+    'the cutout stays within observed skin and sleeves',
   );
-  assert.equal(alpha[27 * width + 16], 0, 'corridor stays segmentation-gated');
 });
 
-test('mask smoothing attacks fast and decays slowly so flicker dims instead of deleting', () => {
-  const smoother = new MaskSmoother();
-  const on = new Uint8ClampedArray([255]),
+test('mask smoothing eases new pixels in and clears vacated pixels without trails', () => {
+  const smoother = new MaskSmoother(),
+    on = new Uint8ClampedArray([255]),
     off = new Uint8ClampedArray([0]);
-  assert.equal(smoother.apply(on)[0], 255, 'first frame seeds directly');
-  const faded = smoother.apply(off)[0];
-  assert.ok(faded > 100, 'one absent frame only dims: ' + faded);
-  assert.ok(smoother.apply(on)[0] > 200, 'reappearing pixel recovers fast');
-  for (let i = 0; i < 20; i++) smoother.apply(off);
-  assert.equal(smoother.state[0], 0, 'sustained absence fades to zero');
+  assert.equal(smoother.apply(on)[0], 255);
+  assert.equal(smoother.apply(off)[0], 0, 'a moving fist leaves no old camera pixels');
+  const entering = smoother.apply(on)[0];
+  assert.ok(entering > 0 && entering < 255, 'new pixels ease in');
 });
 
 // Closed fist: fingertips tucked back toward the wrist so fistScore reads 1.

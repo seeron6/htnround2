@@ -12,7 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
-from face_pipeline import atomic
+from face_pipeline import atomic, require_head_capture
 from head_artifacts import HeadArtifactTransaction, published_folder
 
 
@@ -23,6 +23,7 @@ def rebuild(folder):
     from scripts.template_selection import normalized_frame
 
     folder = Path(folder).resolve()
+    require_head_capture(json.loads((folder / 'capture.json').read_text()))
     with HeadArtifactTransaction(folder, seed=True) as publication:
         accepted = published_folder(folder)
         data = json.loads((publication.stage / 'mesh.json').read_text())
@@ -42,12 +43,20 @@ def rebuild(folder):
             name: (publication.stage / name).read_bytes()
             for name in ('physics-cage.json', 'physics-binding.json')
         }
-        advice = json.loads((folder / 'astra-head-completion.json').read_text())
-        if (folder / 'hair-recognition.json').exists():
+        advice = (
+            json.loads((folder / 'astra-head-completion.json').read_text())
+            if (folder / 'astra-head-completion.json').exists()
+            else None
+        )
+        if advice and (folder / 'hair-recognition.json').exists():
             advice = hair_completion(
                 advice, json.loads((folder / 'hair-recognition.json').read_text())
             )
-        semantics = json.loads((folder / 'head-semantics.json').read_text())
+        semantics = (
+            json.loads((folder / 'head-semantics.json').read_text())
+            if (folder / 'head-semantics.json').exists()
+            else None
+        )
         eyes = (
             json.loads((folder / 'eye-detail.json').read_text())
             if (folder / 'eye-detail.json').exists()
@@ -124,6 +133,11 @@ def rebuild(folder):
             raise ValueError(
                 'Texture rebuild attempted to change the physics bindings.'
             )
+        data['stats']['limitation'] = (
+            'Full-head geometry and appearance. Unphotographed surfaces are '
+            'estimated from the fitted template and captured materials; '
+            'missing hair evidence does not establish the actual hairstyle.'
+        )
         atomic(publication.stage / 'mesh.json', data)
         publication.commit()
         print(

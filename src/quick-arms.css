@@ -1,0 +1,228 @@
+#quick-arm-dialog {
+  box-sizing: border-box;
+  margin: auto;
+  width: min(920px, calc(100vw - 32px));
+  max-width: 920px;
+  max-height: calc(100dvh - 32px);
+  overflow: hidden;
+  padding: 0;
+  border: 1px solid #d0d6cd;
+  border-radius: 18px;
+  background: #fafbf8;
+  color: #232b24;
+}
+#quick-arm-dialog[open] {
+  display: flex;
+  flex-direction: column;
+}
+.quick-arm-content {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 28px;
+}
+.quick-arm-footer {
+  flex: none;
+  display: grid;
+  gap: 10px;
+  padding: 16px 28px;
+  border-top: 1px solid #d0d6cd;
+  background: #fafbf8;
+}
+.quick-arm-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr);
+  gap: 28px;
+}
+.quick-arm-actions button {
+  min-height: 44px;
+}
+#quick-arm-dialog::backdrop {
+  background: #101b17b8;
+  backdrop-filter: blur(6px);
+}
+.quick-arm-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 20px;
+}
+.quick-arm-heading h1 {
+  font-size: 32px;
+  margin: 3px 0 12px;
+  letter-spacing: -1px;
+}
+.quick-arm-eyebrow {
+  font-size: 10px;
+  letter-spacing: 2px;
+  color: #53684e;
+  margin: 0;
+}
+#quick-arm-close {
+  font-size: 24px;
+  padding: 4px 12px;
+}
+.quick-arm-intro {
+  font-size: 14px;
+  line-height: 1.5;
+  max-width: 650px;
+  margin-bottom: 22px;
+}
+.quick-arm-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.45fr) minmax(220px, 1fr);
+  gap: 28px;
+}
+.quick-arm-visuals,
+.quick-arm-options {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+#quick-arm-preview {
+  width: 100%;
+  height: 300px;
+  overflow: hidden;
+  border-radius: 12px;
+  background: #e9ece8;
+}
+#quick-arm-preview canvas {
+  display: block;
+}
+.quick-arm-view-label {
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  color: #64725d;
+}
+#quick-arm-video {
+  display: block;
+  width: 100%;
+  max-height: 260px;
+  object-fit: contain;
+  transform: scaleX(-1);
+  border-radius: 8px;
+  background: #1c231d;
+}
+.quick-arm-feedback {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 8px;
+}
+.quick-arm-feedback p {
+  margin: 0;
+  padding: 9px;
+  border-radius: 8px;
+  background: #f1e9d6;
+  color: #665225;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.quick-arm-feedback p[data-state='ready'] {
+  background: #e1eddf;
+  color: #285333;
+}
+#quick-arm-dialog[data-scanning='true'] #quick-arm-preview {
+  height: 180px;
+}
+.quick-arm-hint {
+  font-size: 11px;
+  line-height: 1.5;
+  color: #64705e;
+  margin: 0;
+}
+#quick-arm-status {
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0;
+}
+#quick-arm-status[data-state='success'] {
+  color: #285333;
+  font-weight: 600;
+}
+#quick-arm-status[data-state='error'] {
+  color: #9a2a21;
+  font-weight: 600;
+}
+.quick-arm-options label {
+  font-size: 12px;
+}
+.quick-arm-options select {
+  width: 100%;
+  min-width: 0;
+}
+.quick-arm-colors {
+  display: flex;
+  gap: 12px;
+  margin: 4px 0;
+}
+.quick-arm-colors label {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.quick-arm-colors input {
+  width: 100%;
+  height: 38px;
+  padding: 3px;
+}
+.quick-arm-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+#quick-arm-dialog progress {
+  width: 100%;
+  accent-color: #536e43;
+}
+#quick-arm-dialog [hidden] {
+  display: none !important;
+}
+.quick-arm-options details {
+  margin-top: 8px;
+  font-size: 11px;
+}
+.quick-arm-options details button {
+  margin-top: 8px;
+}
+.demo-arm-choices {
+  display: grid;
+  gap: 8px;
+  text-align: left;
+  margin: 18px 0;
+  padding: 16px;
+  border: 1px solid #d8ddcf;
+  border-radius: 10px;
+}
+.demo-arm-choices label {
+  font-size: 12px;
+  font-weight: 600;
+}
+.demo-arm-choices select {
+  width: 100%;
+}
+.demo-arm-choices p {
+  margin: 0;
+  font-size: 12px;
+  color: #636e59;
+}
+@media (max-width: 640px) {
+  .quick-arm-content {
+    padding: 18px;
+  }
+  .quick-arm-footer {
+    padding: 12px 18px;
+  }
+  .quick-arm-actions {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+  .quick-arm-layout {
+    grid-template-columns: 1fr;
+  }
+  #quick-arm-preview {
+    height: 240px;
+  }
+}

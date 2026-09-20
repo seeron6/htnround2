@@ -16,6 +16,7 @@ import scripts.pipeline_accel as accel
 
 accel.install_leaves()
 import scripts.build_photo_face as build
+from scripts.pipeline_failure import handle_api_limits
 
 accel.install_prefetch(build)
 
@@ -35,5 +36,6 @@ if __name__ == '__main__':
         from contextlib import nullcontext
 
         trace = nullcontext()
-    with trace:
-        build.run(args.folder.resolve(), not args.local_only)
+    with handle_api_limits():
+        with trace:
+            build.run(args.folder.resolve(), not args.local_only)

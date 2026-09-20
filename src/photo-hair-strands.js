@@ -50,9 +50,41 @@ export function photoStrandGeometry(source, spec, p) {
     children = 3;
   const src = source.attributes.position.array,
     sn = source.attributes.normal.array;
-  const count = Math.floor(
+  const candidateCount = Math.floor(
     (spec.rootTriangles.length / 3) * clamp(p.density ?? 0.8, 0, 1),
   );
+  // A few side-camera guide roots sit just over the photographed hairline but
+  // their recorded curves travel toward the cheek. Keep the crown and rear
+  // locks, while letting the baked side texture own this short transition;
+  // otherwise those roots render as isolated dark scratches in profile.
+  const validRoots = [];
+  const filterSideTransitions =
+    spec.mode === 'photo-strands' &&
+    guides.observedOnly === true &&
+    guides.surfaceConformed === true;
+  for (let i = 0; i < candidateCount; i++) {
+    let y = 0,
+      z = 0,
+      nx = 0,
+      ny = 0,
+      nz = 0;
+    for (let k = 0; k < 3; k++) {
+      const id = spec.rootTriangles[i * 3 + k],
+        weight = spec.rootWeights[i * 3 + k];
+      y += src[id * 3 + 1] * weight;
+      z += src[id * 3 + 2] * weight;
+      nx += sn[id * 3] * weight;
+      ny += sn[id * 3 + 1] * weight;
+      nz += sn[id * 3 + 2] * weight;
+    }
+    const sideTransition = z > -0.12 && y < spec.hairlineY + 0.06 && nz > -0.35;
+    if (
+      guides.confidence[i] >= (filterSideTransitions ? 0.5 : 0.08) &&
+      (!filterSideTransitions || !sideTransition)
+    )
+      validRoots.push(i);
+  }
+  const count = validRoots.length;
   const max = count * children * (segments + 1) * sides;
   const positions = new Float32Array(max * 3),
     normals = new Float32Array(max * 3),
@@ -77,7 +109,8 @@ export function photoStrandGeometry(source, spec, p) {
   const lengthScale = clamp((p.lengthMm ?? 75) / Math.max(reference, 1), 0.35, 1.6);
   let vertex = 0,
     index = 0;
-  for (let i = 0; i < count; i++) {
+  for (let row = 0; row < count; row++) {
+    const i = validRoots[row];
     root.set(0, 0, 0);
     normal.set(0, 0, 0);
     for (let k = 0; k < 3; k++) {
@@ -89,6 +122,26 @@ export function photoStrandGeometry(source, spec, p) {
       normal.addScaledVector(point, w);
     }
     normal.normalize();
+    // The rear video views carry reliable roots but several tracked locks end
+    // after only a few millimetres. Leaving those guide curves at their
+    // observed length exposes a bald posterior slab in neutral and profile
+    // views. Extend only those short, rear-facing locks along their recorded
+    // direction; the bound root still follows the deformable head.
+    let guideLength = 0;
+    for (let j = 1; j <= segments; j++) {
+      const a = (i * (segments + 1) + j - 1) * 3,
+        b = (i * (segments + 1) + j) * 3;
+      guideLength += Math.hypot(
+        guides.curveOffsets[b] - guides.curveOffsets[a],
+        guides.curveOffsets[b + 1] - guides.curveOffsets[a + 1],
+        guides.curveOffsets[b + 2] - guides.curveOffsets[a + 2],
+      );
+    }
+    const posteriorCompletion =
+      root.z < -0.12 && guideLength < 0.014
+        ? clamp(1.9 + (0.014 - guideLength) * 40, 1.9, 2.45)
+        : 1;
+    const posteriorDrop = posteriorCompletion > 1 ? 0.012 : 0;
     const top = clamp((root.y - spec.hairlineY + 0.025) / 0.065, 0, 1);
     // Continuous spatial phase keeps neighboring fibers in locks, avoiding
     // checkerboard-sized chunks and synchronized identical sine waves.
@@ -110,8 +163,12 @@ export function photoStrandGeometry(source, spec, p) {
         spacing =
           (child - 1) *
           (conformed ? 0.0001 + rand() * 0.00007 : 0.00007 + rand() * 0.00004);
+      const sideDetail = root.z > -0.08 && root.y < spec.hairlineY + 0.07;
       const radius = observedOnly
-        ? 0.000024 + rand() * 0.000018
+        ? // The old 24–42 µm fibers were visible only as texture at the
+          // rear review scale. The source locks are thick enough to support
+          // a fuller, lock-readable radius while remaining hair-like.
+          (sideDetail ? 0.00025 : 0.00072) + rand() * (sideDetail ? 0.00008 : 0.00028)
         : 0.000045 + rand() * 0.000035;
       const variation = observedOnly ? 0.96 + rand() * 0.08 : 0.72 + rand() * 0.44;
       color.setRGB(
@@ -124,7 +181,7 @@ export function photoStrandGeometry(source, spec, p) {
           envelope = Math.sin(Math.PI * t);
         const q = curve[j]
           .fromArray(guides.curveOffsets, at)
-          .multiplyScalar(lengthScale)
+          .multiplyScalar(lengthScale * posteriorCompletion)
           .add(root);
         cn[j].fromArray(guides.curveNormals, at).normalize();
         const prev = Math.max(0, j - 1),
@@ -147,6 +204,31 @@ export function photoStrandGeometry(source, spec, p) {
           frizz *
           envelope;
         q.addScaledVector(across, spacing + lateral + fuzz);
+        if (posteriorCompletion > 1) {
+          // Short tapered back hair falls toward the nape instead of pointing
+          // straight out from the occiput. Keep the drop bounded so it cannot
+          // cross the neck or the independent temple arms.
+          q.y -= posteriorDrop * t * t;
+          q.addScaledVector(normal, 0.00018 * envelope);
+        }
+        // Side-profile roots near the measured hairline can carry a small
+        // downward guide error. Keep those fibers above the transition into
+        // the cheek; the registered side texture already covers the taper.
+        if (root.z > -0.1) q.y = Math.max(q.y, spec.hairlineY + 0.006);
+        // A side lock must not swing through the temporal plane toward the
+        // face when its photographed curve is rebound to the fitted head.
+        // Limit that forward excursion to a small clearance over its root.
+        if (root.z < -0.05) q.z = Math.min(q.z, root.z + 0.006);
+        // The registered guide normals can be tangent to the photographed
+        // lock. Keep every strand just outside the independent scalp so the
+        // fibers contribute real volume instead of disappearing inside the
+        // shell at profile and crown angles.
+        q.addScaledVector(normal, 0.0015 + 0.0035 * top + 0.0015 * envelope);
+        // A few crown guides overshoot their captured silhouette at the final
+        // station. Keep those locks as short flyaways over the quiff instead
+        // of letting them read as isolated wires above the head.
+        if (root.y > spec.hairlineY - 0.005)
+          q.y = Math.min(q.y, root.y + 0.009 + 0.006 * top);
         q.addScaledVector(
           cn[j],
           0.00007 +
@@ -214,4 +296,142 @@ export function photoStrandGeometry(source, spec, p) {
   geometry.setIndex(new THREE.BufferAttribute(indices, 1));
   geometry.computeBoundingSphere();
   return { geometry, roots, strandCount: count * children };
+}
+
+// The saved video guides are strongest around the quiff and temples. Build a
+// small, surface-bound completion for the short rear guides so the posterior
+// silhouette remains covered when the head is rotated away from the camera.
+// This samples only the independent reconstructed head; it never uses Meshy
+// geometry or camera-facing cards.
+export function posteriorCompletionGeometry(source, spec, p = {}) {
+  const position = source.attributes.position.array,
+    normal = source.attributes.normal.array,
+    index =
+      source.index?.array ??
+      Uint32Array.from({ length: position.length / 3 }, (_, i) => i),
+    candidates = new Map();
+  for (let f = 0; f < index.length; f += 3) {
+    const ids = [index[f], index[f + 1], index[f + 2]],
+      centroid = [0, 0, 0],
+      faceNormal = [0, 0, 0];
+    for (const id of ids) {
+      for (let a = 0; a < 3; a++) centroid[a] += position[id * 3 + a] / 3;
+      for (let a = 0; a < 3; a++) faceNormal[a] += normal[id * 3 + a] / 3;
+    }
+    // Rear scalp only: keep the visible temples and face governed by the
+    // observed guides and avoid putting fibers across the ear/neck boundary.
+    if (
+      centroid[2] > -0.15 ||
+      centroid[1] < -0.012 ||
+      centroid[1] > 0.125 ||
+      faceNormal[2] > -0.08
+    )
+      continue;
+    const key = [
+      Math.round((centroid[0] + 0.12) / 0.02),
+      Math.round((centroid[1] + 0.012) / 0.018),
+      Math.round((centroid[2] + 0.27) / 0.03),
+    ].join(':');
+    // Prefer the triangle whose normal points most clearly out of the rear
+    // surface. This keeps the completion from selecting cheek/ear triangles.
+    const score = -faceNormal[2] + Math.max(0, faceNormal[1]) * 0.15;
+    if (!candidates.has(key) || candidates.get(key).score < score)
+      candidates.set(key, { ids, centroid, faceNormal, score });
+  }
+  const selected = [...candidates.values()];
+  if (!selected.length) return { geometry: null, bindings: [], strandCount: 0 };
+  const rand = random((spec.seed ?? 42) ^ 0x9e3779b9),
+    density = clamp(p.posteriorDensity ?? 0.88, 0.25, 1),
+    keep = selected.filter(() => rand() < density),
+    segments = 12,
+    sides = 3,
+    children = 2,
+    positions = [],
+    normals = [],
+    colors = [],
+    uv = [],
+    indices = [],
+    bindings = [];
+  const color = new THREE.Color(),
+    root = new THREE.Vector3(),
+    surfaceNormal = new THREE.Vector3(),
+    tangent = new THREE.Vector3(),
+    across = new THREE.Vector3(),
+    up = new THREE.Vector3(),
+    point = new THREE.Vector3();
+  const rgb =
+    p.colorSrgb?.length === 3 && p.colorSrgb.every(Number.isFinite)
+      ? p.colorSrgb
+      : spec.parameters?.colorSrgb?.length === 3
+        ? spec.parameters.colorSrgb
+        : [0.06, 0.05, 0.04];
+  for (const [rootIndex, candidate] of keep.entries()) {
+    root.set(...candidate.centroid);
+    surfaceNormal.set(...candidate.faceNormal).normalize();
+    tangent.set(0, -1, 0);
+    tangent.addScaledVector(surfaceNormal, -tangent.dot(surfaceNormal));
+    if (tangent.lengthSq() < 1e-6) tangent.set(0, 0, -1);
+    tangent.normalize();
+    across.crossVectors(tangent, surfaceNormal).normalize();
+    const length =
+      0.012 + 0.014 * clamp((root.y + 0.012) / 0.137, 0, 1) * (0.86 + rand() * 0.22);
+    const start = positions.length / 3;
+    bindings.push({
+      ids: candidate.ids,
+      weights: [1 / 3, 1 / 3, 1 / 3],
+      root: root.clone(),
+      normal: surfaceNormal.clone(),
+      start,
+      count: children * (segments + 1) * sides,
+    });
+    for (let child = 0; child < children; child++) {
+      const phase = rand() * Math.PI * 2,
+        radius = 0.00035 + rand() * 0.00012,
+        childOffset = (child - 0.5) * 0.00016;
+      color.setRGB(
+        ...rgb.map((v) => clamp(v * (0.82 + rand() * 0.24), 0, 1)),
+        THREE.SRGBColorSpace,
+      );
+      const first = positions.length / 3;
+      for (let j = 0; j <= segments; j++) {
+        const t = j / segments,
+          envelope = Math.sin(Math.PI * t),
+          bend = Math.sin(t * Math.PI + phase) * 0.0012 * envelope;
+        point
+          .copy(root)
+          .addScaledVector(tangent, length * t)
+          .addScaledVector(surfaceNormal, 0.00018 + 0.00055 * envelope)
+          .addScaledVector(across, childOffset + bend);
+        const axis = tangent.clone();
+        up.crossVectors(across, axis).normalize();
+        const radial = new THREE.Vector3();
+        for (let side = 0; side < sides; side++) {
+          const theta = (side / sides) * Math.PI * 2;
+          radial
+            .copy(across)
+            .multiplyScalar(Math.cos(theta))
+            .addScaledVector(up, Math.sin(theta));
+          positions.push(
+            ...point.clone().addScaledVector(radial, radius * (1 - t * 0.88)),
+          );
+          normals.push(...radial);
+          colors.push(color.r, color.g, color.b);
+          uv.push(side / sides, t);
+          if (j < segments) {
+            const a = first + j * sides + side,
+              b = first + j * sides + ((side + 1) % sides);
+            indices.push(a, b, a + sides, b, b + sides, a + sides);
+          }
+        }
+      }
+    }
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+  geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  geometry.setIndex(indices);
+  geometry.computeBoundingSphere();
+  return { geometry, bindings, strandCount: keep.length * children };
 }

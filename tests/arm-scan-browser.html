@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="UTF-8" />
+  <title>Arm scan browser fixture</title>
+  <style>
+    body {
+      margin: 24px;
+      font: 15px system-ui;
+      background: #edf0ec;
+    }
+    button,
+    select {
+      padding: 10px;
+      font: inherit;
+    }
+    #stage {
+      width: 900px;
+      height: 500px;
+    }
+    pre {
+      white-space: pre-wrap;
+    }
+  </style>
+  <h1>Synthetic arm scan · browser validation</h1>
+  <p>
+    Generated pixels and joint fixtures, no webcam. Uses the production scan, presets,
+    texture fitting and arm physics.
+  </p>
+  <button id="open">Open synthetic scan</button>
+  <button id="recoil">Test left-arm contact recoil</button>
+  <label
+    >Camera evidence
+    <select id="evidence">
+      <option value="clear">Both arms clear</option>
+      <option value="body">Body outside view</option>
+      <option value="elbow">Right elbow outside view</option>
+      <option value="wrist">Clear hands, uncertain body wrists</option>
+    </select>
+  </label>
+  <pre id="results"></pre>
+  <div id="stage"></div>
+  <script type="module">
+    import * as THREE from 'three';
+    import { QuickArms } from '/src/quick-arms.js';
+    import { syntheticArms, appearanceArms } from './helpers/synthetic-arms.mjs';
+    const fixture = new URLSearchParams(location.search).has('appearance')
+      ? appearanceArms()
+      : syntheticArms();
+    const canvas = document.createElement('canvas');
+    canvas.width = fixture.image.width;
+    canvas.height = fixture.image.height;
+    canvas
+      .getContext('2d')
+      .putImageData(
+        new ImageData(fixture.image.data, canvas.width, canvas.height),
+        0,
+        0,
+      );
+    const stream = canvas.captureStream(15);
+    const tracking = {
+      active: true,
+      poseReady: true,
+      stream,
+      enableBody: async () => {},
+    };
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color('#edf0ec');
+    const camera = new THREE.PerspectiveCamera(62, 1.8, 0.01, 3);
+    camera.lookAt(0, -0.12, -0.4);
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x657461, 3));
+    const light = new THREE.DirectionalLight(0xffffff, 2);
+    light.position.set(0, 2, 1);
+    scene.add(light);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(900, 500);
+    document.querySelector('#stage').append(renderer.domElement);
+    let mode = 'preset';
+    const arms = new QuickArms({
+      tracking,
+      camera,
+      scene,
+      getMode: () => mode,
+      setMode: (value) => {
+        mode = value;
+      },
+    });
+    // Static review mode avoids continuous WebGL work while inspecting a scan
+    // on a busy demo machine. Controls still render the production pose once.
+    const still = new URLSearchParams(location.search).has('still');
+    if (still) {
+      arms.renderPreview = () => {
+        QuickArms.prototype.renderPreview.call(arms);
+        cancelAnimationFrame(arms.animation);
+      };
+      arms.dialog.addEventListener('input', () => arms.renderPreview());
+    }
+    document.querySelector('#open').onclick = () => arms.open();
+    document.querySelector('#recoil').onclick = () =>
+      window.dispatchEvent(
+        new CustomEvent('punching-face-contact', {
+          detail: { side: 'left', speed: 3 },
+        }),
+      );
+    setInterval(() => {
+      if (!tracking.scanArms) return;
+      const timestamp = performance.now();
+      const evidence = document.querySelector('#evidence').value;
+      const pose = structuredClone(fixture.pose);
+      if (evidence === 'elbow') pose[14].visibility = 0.1;
+      if (evidence === 'wrist') {
+        pose[15].visibility = 0.2;
+        pose[16].visibility = 0.35;
+        pose[15].x += 0.025;
+      }
+      tracking.onArmSample({
+        armSample: fixture.image,
+        landmarks: fixture.landmarks,
+        pose: { landmarks: evidence === 'body' ? [] : [pose], timestamp },
+        timestamp,
+      });
+    }, 150);
+    const result = document.querySelector('#results');
+    let last = performance.now();
+    renderer.setAnimationLoop((time) => {
+      if (!arms.isOpen && !still) {
+        arms.update([], Math.min(0.03, (time - last) / 1000));
+        renderer.render(scene, camera);
+      }
+      last = time;
+      result.textContent = JSON.stringify(arms.state, null, 2);
+    });
+    window.addEventListener('pagehide', () => {
+      arms.dispose();
+      stream.getTracks().forEach((t) => t.stop());
+      renderer.dispose();
+    });
+  </script>
+</html>

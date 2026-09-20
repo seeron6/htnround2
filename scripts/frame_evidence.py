@@ -1,9 +1,30 @@
 """Choose clear overlapping views using measured image quality and camera angle."""
 
-import json, hashlib
+import json, hashlib, tempfile
+from pathlib import Path
 import numpy as np, cv2
 from PIL import Image
 from face_pipeline import atomic
+
+
+def _save_source_cache(path, result):
+    # Independent reconstruction readers can finish the same cache together.
+    # A unique temporary file keeps their atomic replacements from colliding.
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode='w',
+            prefix='.frame-evidence-',
+            suffix='.tmp',
+            dir=path.parent,
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(result, stream, allow_nan=False)
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def assess_frames(folder, output_folder=None):
@@ -15,14 +36,24 @@ def assess_frames(folder, output_folder=None):
         raw = path.read_bytes()
         digest.update(raw)
     signature = digest.hexdigest()
-    cache = (folder if output_folder is None else output_folder) / 'frame-evidence.json'
-    previous = folder / 'frame-evidence.json'
-    if previous.exists():
-        result = json.loads(previous.read_text())
-        if result.get('inputHash') == signature:
-            if cache != previous:
-                atomic(cache, result)
-            return result['frames']
+    # These scores are a reusable source-image cache. The similarly named
+    # frame-evidence.json is a published model audit: creating or changing it
+    # at the capture root would invalidate an active legacy-model transaction.
+    cache = folder / 'frame-evidence-cache.json'
+    audit = output_folder / 'frame-evidence.json' if output_folder is not None else None
+
+    def save(result, cached=False):
+        if not cached:
+            _save_source_cache(cache, result)
+        if audit is not None:
+            atomic(audit, result)
+        return result['frames']
+
+    for previous in (cache, folder / 'frame-evidence.json'):
+        if previous.exists():
+            result = json.loads(previous.read_text())
+            if result.get('inputHash') == signature:
+                return save(result, cached=previous == cache)
     for frame in frames:
         with Image.open(folder / 'images' / frame['filename']) as image:
             rgba = np.array(image.convert('RGBA'))
@@ -56,8 +87,7 @@ def assess_frames(folder, output_folder=None):
             'clippedFraction': clipped,
             'foregroundPixels': int(np.sum(rgba[:, :, 3] > 220)),
         }
-    atomic(
-        cache,
+    return save(
         {
             'version': 1,
             'inputHash': signature,
@@ -69,7 +99,6 @@ def assess_frames(folder, output_folder=None):
             ),
         },
     )
-    return images
 
 
 def choose_views(views, frames, targets, quality):

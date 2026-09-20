@@ -1,0 +1,253 @@
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: #eeede7;
+  color: #26372e;
+  font:
+    15px/1.5 system-ui,
+    sans-serif;
+}
+main {
+  max-width: 1500px;
+  margin: auto;
+  padding: 26px 34px 40px;
+}
+a {
+  color: inherit;
+}
+header {
+  position: relative;
+  border-bottom: 1px solid #c7cfc3;
+  padding-bottom: 16px;
+}
+.eyebrow {
+  display: block;
+  font-size: 11px;
+  letter-spacing: 1.8px;
+  font-weight: 650;
+}
+header .eyebrow {
+  position: absolute;
+  right: 0;
+  top: 5px;
+}
+h1 {
+  font-size: clamp(30px, 4vw, 48px);
+  line-height: 1.1;
+  letter-spacing: -1.8px;
+  font-weight: 550;
+  margin: 20px 0 12px;
+}
+h2 {
+  font-size: 20px;
+  font-weight: 570;
+  margin: 0;
+}
+p {
+  color: #56645a;
+  margin: 8px 0;
+}
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px 0;
+}
+nav {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+button,
+select {
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: 1px solid #b3bfb0;
+  border-radius: 6px;
+  padding: 7px 12px;
+  cursor: pointer;
+}
+button:hover {
+  background: #dbe1d5;
+}
+button[aria-pressed='true'] {
+  background: #304d3b;
+  color: #f4f5ee;
+  border-color: #304d3b;
+}
+button:focus-visible,
+select:focus-visible {
+  outline: 3px solid #71917b;
+  outline-offset: 2px;
+}
+.comparison {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px;
+}
+.comparison article {
+  min-width: 0;
+}
+.model-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 10px;
+}
+.model-heading span {
+  font-size: 10px;
+  letter-spacing: 1.4px;
+}
+.stage {
+  height: clamp(340px, 47vw, 540px);
+  position: relative;
+  background: #222c28;
+  border-radius: 8px;
+  overflow: hidden;
+  touch-action: none;
+}
+.stage canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+#meshy-pending {
+  color: #e3e9df;
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  padding: 35px;
+  text-align: center;
+}
+.stats {
+  font-size: 13px;
+  min-height: 20px;
+}
+.caption {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  justify-content: space-between;
+  font-size: 12px;
+  margin: 8px 0 26px;
+}
+.caption p {
+  max-width: 780px;
+}
+.caption label {
+  white-space: nowrap;
+}
+.caption select {
+  margin-left: 8px;
+  padding: 4px;
+}
+.source-section {
+  display: grid;
+  grid-template-columns: 1fr 1.5fr;
+  gap: 30px;
+  border-top: 1px solid #c7cfc3;
+  padding: 25px 0;
+  align-items: center;
+}
+.source-section h2 {
+  margin: 7px 0;
+}
+.small,
+.footnote {
+  font-size: 12px;
+}
+#source-views {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+}
+.source-photo {
+  border: 0;
+  padding: 0;
+  text-align: left;
+}
+.source-photo img {
+  width: 100%;
+  aspect-ratio: 1;
+  display: block;
+  object-fit: contain;
+  background: #d4dbcf;
+  border-radius: 5px;
+}
+.source-photo span {
+  display: block;
+  padding-top: 5px;
+  font-size: 12px;
+}
+.methods {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 45px;
+  border-top: 1px solid #c7cfc3;
+  padding: 25px 0;
+}
+.methods li {
+  padding: 4px 0;
+}
+.methods ol {
+  padding-left: 20px;
+}
+.methods p,
+.methods a {
+  font-size: 13px;
+}
+.footnote {
+  border-top: 1px solid #c7cfc3;
+  padding-top: 18px;
+}
+#error {
+  color: #97372b;
+}
+dialog {
+  border: 1px solid #94a38e;
+  border-radius: 10px;
+  background: #e3e7db;
+  max-width: 90vw;
+  max-height: 94vh;
+}
+dialog::backdrop {
+  background: #17201bc9;
+}
+dialog img {
+  display: block;
+  max-width: 80vw;
+  max-height: 78vh;
+}
+dialog button {
+  display: block;
+  margin: 0 0 12px auto;
+}
+@media (max-width: 560px) {
+  main {
+    padding: 18px;
+  }
+  header .eyebrow {
+    position: static;
+    margin-top: 15px;
+  }
+  .comparison,
+  .methods,
+  .source-section {
+    grid-template-columns: 1fr;
+  }
+  .stage {
+    height: 420px;
+  }
+  .caption {
+    display: block;
+  }
+  .caption label {
+    display: block;
+    margin-top: 12px;
+  }
+}

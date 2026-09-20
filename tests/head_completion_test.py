@@ -14,6 +14,19 @@ from scripts.astra_head_completion import apply_shape_prior
 
 
 class CompletionTests(unittest.TestCase):
+    def test_texture_bake_rejects_legacy_face_crops_before_writing(self):
+        import tempfile, json
+        from scripts.photo_geometry import bake_photographs
+
+        for region in (None, 'face'):
+            with tempfile.TemporaryDirectory() as temporary:
+                folder = Path(temporary)
+                manifest = {'frames': [], 'captureRegion': region}
+                (folder / 'capture.json').write_text(json.dumps(manifest))
+                with self.assertRaisesRegex(ValueError, 'whole-head'):
+                    bake_photographs(folder, *([None] * 10))
+                self.assertEqual([p.name for p in folder.iterdir()], ['capture.json'])
+
     def scalp_fixture(self, count):
         p = np.zeros((470, 3))
         p[10, 1], p[152, 1] = 0.1, -0.1

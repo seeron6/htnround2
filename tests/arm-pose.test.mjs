@@ -95,8 +95,8 @@ test('automatic guard calibration makes a tracked hand punch-ready', () => {
     tracking.tick(1005 + frame * 20, hands);
   }
   assert.equal(tracking.calibration.size, 1);
-  assert.equal(hands[0].tracked, true);
-  assert.equal(hands[0].calibrated, true);
+  assert.equal(hands[1].tracked, true);
+  assert.equal(hands[1].calibrated, true);
 });
 
 test('body coordinates place each captured arm on the anatomical side and in front of the eye origin', () => {

@@ -38,6 +38,11 @@ function AppShell() {
       if (stageShell && stageSlot.current) stageSlot.current.appendChild(stageShell);
       if (right && rightSlot.current) rightSlot.current.appendChild(right);
       dialogs.forEach((d) => document.body.appendChild(d));
+      // The stage slot is a z-index:10 stacking context, so anything left inside it paints
+      // under the demo HUD (z-index 45) no matter how high its own z-index is. Lift the
+      // toast to the body, like the dialogs, so its messages stay readable.
+      const toast = document.getElementById('toast');
+      if (toast) document.body.appendChild(toast);
 
       // Punch detector: keep #slap-hud alive in the DOM (main.js still binds
       // the media stream to #slap-preview and toggles .active on the hud),
@@ -66,7 +71,6 @@ function AppShell() {
       bakeBeatMeButton();
       addHeaderLogo();
       hideRoomSection(left);
-      prepareCameraSection(left);
       // The loader and tracking loop still update these status elements.
       const stageTop = stageShell?.querySelector<HTMLElement>('.stage-top');
       if (stageTop) stageTop.style.display = 'none';
@@ -282,14 +286,6 @@ function swapViewSwitch(stageShell: HTMLElement | null | undefined) {
       onChange={(id) => handlers.get(id)?.()}
     />,
   );
-}
-
-// Onboarding owns calibration; the dashboard keeps its manual recalibrate control.
-function prepareCameraSection(leftPanel: HTMLElement | null | undefined) {
-  for (const id of ['scan-arms', 'arm-appearance']) {
-    const element = document.getElementById(id);
-    if (element) element.style.display = 'none';
-  }
 }
 
 // Immersive fullscreen keyboard support:

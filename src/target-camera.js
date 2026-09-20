@@ -348,10 +348,25 @@ export class TargetTracking {
   tick(now) {
     if (!this.active) return null;
     this.scheduleFrame();
-    const results = this.results;
+    return this.consume(this.results, now);
+  }
+  // Consume the application's existing worker results without opening another camera or worker.
+  reset() {
+    this.extractor.reset();
+    this.estimators.clear();
+    this.appliedTimestamp = -Infinity;
+    this.lastDepth = null;
+    this.debugSpan = 0;
+    this.lastHands = 0;
+  }
+  consume(results, now) {
     // No new frame: the extractor still runs, because censoring (a fist that blurred out at full
     // extension) is a property of time passing, not of frames arriving.
-    if (!results || results.timestamp === this.appliedTimestamp)
+    if (
+      !results ||
+      !Number.isFinite(results.timestamp) ||
+      results.timestamp <= this.appliedTimestamp
+    )
       return this.extractor.tick(now, this.#solveOptions());
     this.appliedTimestamp = results.timestamp;
     this.counts.frames++;

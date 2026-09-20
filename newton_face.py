@@ -5,12 +5,20 @@ Newton solves contact, shear and volumetric constraints on the tetrahedral cage.
 """
 
 from pathlib import Path
-import json, time
+import json, os, time
 import numpy as np
 import warp as wp
 import newton
 
 ROOT = Path(__file__).resolve().parent
+# OFF unless CONTACT_PHYSICS_SLEEP=1. Found with Sentry tracing + profiling (TRACKS/SENTRY.md,
+# finding 1): a step costs ~30 ms of a 33 ms frame whether or not anything is touching the face,
+# because the cost is 512 kernel launches, not arithmetic. A second after a punch the surface moves
+# under a micron per frame, so nothing visible is being computed. With the flag on, a face that has
+# been that still for REST_FRAMES answers from its last result until the next impact wakes it.
+SLEEP_WHEN_STILL = os.environ.get('CONTACT_PHYSICS_SLEEP') == '1'
+REST_CHANGE = 2e-6  # metres between frames; a pixel on a life-size head is ~100x this
+REST_FRAMES = 10
 OVAL = [
     10,
     338,
@@ -81,6 +89,13 @@ class NewtonFace:
         self.contact = None
         self.impacts = 0
         self.last_peak = 0.0
+        self.sleep_when_still = SLEEP_WHEN_STILL
+        self.asleep, self.still_frames, self.last_offset, self.last_result = (
+            False,
+            0,
+            None,
+            None,
+        )
         self.softness = float(np.clip(softness, 0, 1))
         x, y, z = self.rest.T
         cheek = np.exp(
@@ -221,10 +236,19 @@ class NewtonFace:
             'start': self.time,
         }
         self.impacts += 1
+        self.asleep, self.still_frames = False, 0  # the only thing that wakes a resting face
 
     def step(self, dt=1 / 30):
         started = time.perf_counter()
         dt = float(np.clip(dt, 1 / 240, 1 / 30))
+        if self.asleep and not self.contact:
+            self.time += dt
+            return {
+                **self.last_result,
+                'stepMs': (time.perf_counter() - started) * 1000,
+                'simulationTime': self.time,
+                'asleep': True,
+            }
         steps = 8
         h = dt / steps
         for _ in range(steps):
@@ -292,7 +316,7 @@ class NewtonFace:
                 'Newton face simulation exceeded its stable range. Reset the face.'
             )
         self.last_peak = peak
-        return {
+        result = {
             'offsets': offset.astype(np.float32).ravel().tolist(),
             'peakMm': peak * 1000,
             'minimumVolumeRatio': float(volume.min()),
@@ -301,6 +325,18 @@ class NewtonFace:
             'simulationTime': self.time,
             'contacts': self.impacts,
         }
+        if self.sleep_when_still:
+            moved = (
+                float(np.abs(offset - self.last_offset).max())
+                if self.last_offset is not None
+                else np.inf
+            )
+            self.last_offset = offset.copy()
+            still = self.contact is None and moved < REST_CHANGE
+            self.still_frames = self.still_frames + 1 if still else 0
+            if self.still_frames >= REST_FRAMES:
+                self.asleep, self.last_result = True, result
+        return result
 
     def info(self):
         return {

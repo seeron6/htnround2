@@ -79,3 +79,25 @@ test('a legacy cage from a different head cannot be paired with a valid texture'
   };
   await assert.rejects(loadHeadBundle('scan', fetcher), /physics cage does not match/);
 });
+
+test('an older face-only material cannot be loaded as a completed head', async () => {
+  for (const asset of ['mesh.json', 'texture-atlas.json']) {
+    const a = bundle('legacy', 1);
+    const data = JSON.parse(a.files[asset]);
+    data.stats =
+      asset === 'mesh.json'
+        ? { appearance: { rearAppearance: 'Unobserved gray' } }
+        : { rearAppearance: 'Unobserved gray' };
+    a.files[asset] = JSON.stringify(data);
+    const fetcher = async (url) => {
+      const name = new URL(url, 'http://localhost').searchParams.get('asset');
+      return name === 'model-release.json'
+        ? Response.json(a.release)
+        : new Response(a.files[name]);
+    };
+    await assert.rejects(
+      loadHeadBundle('scan', fetcher),
+      /Record or import whole-head views/,
+    );
+  }
+});

@@ -4,11 +4,37 @@ import {
   MAX_PERMANENT_DISPLACEMENT,
 } from './tissue-field.js';
 import { DeformationGradientRig } from './deformation-gradient.js';
-import { PainExpression, painEnvelope } from './pain-expression.js';
+import {
+  PainRig,
+  painTimeline,
+  painDuration,
+  painGasp,
+  headFlinch,
+  headFlinchCurve,
+  limitHeadPose,
+} from './pain-rig.js';
+import { wouldFracture, FRACTURE_LIMIT, SWELL_SECONDS } from './bone-fracture.js';
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const smooth = (a, b, v) => {
   const t = clamp((v - a) / (b - a), 0, 1);
   return t * t * (3 - 2 * t);
+};
+// Every array a live event is drawn from: the contact alone, then each pose of
+// the pain rig (src/pain-rig.js) with the contact and without it. The ache
+// arrives after the skin has recovered, so it has no combined form.
+const BLEND = [
+  'target',
+  'flinchCombined',
+  'flinchTarget',
+  'combinedTarget',
+  'reactionTarget',
+  'acheTarget',
+];
+const peakOf = (field) => {
+  let peak = 0;
+  for (let i = 0; i < field.length; i += 3)
+    peak = Math.max(peak, Math.hypot(field[i], field[i + 1], field[i + 2]));
+  return peak;
 };
 
 // Art-directed impact correctives, layered over the contact solver. These are
@@ -21,6 +47,11 @@ export class FaceImpactRig {
     this.events = [];
     this.mode = 'live';
     this.reactionEnabled = true;
+    // What the reaction asks of the rest of the head each step: a turn for the
+    // recoil spring to chase (src/physics.js) and a parted mouth for the speech
+    // rig, which is the one that knows which lip is which.
+    this.headPose = { x: 0, y: 0, z: 0 };
+    this.gasp = 0;
     this.setAnchors(anchors);
     if (topology) {
       this.topology = topology;
@@ -81,7 +112,7 @@ export class FaceImpactRig {
 
   prepare() {
     this.gradientRig ??= new DeformationGradientRig(this.tissue);
-    this.painExpression ??= new PainExpression(this.tissue);
+    this.painExpression ??= new PainRig(this.tissue);
     this.tissue.prepareAnatomy(this.anchors);
     this.painExpression.prepare(this.anchors);
     // Build the triangle guard while the model is loading, not on its first hit.
@@ -136,18 +167,23 @@ export class FaceImpactRig {
       !this.asyncRestEdited &&
       !this.preparer.failed &&
       this.mode === 'live' &&
-      p.magnitude <= 0.9 &&
-      !this.permanent.some((v) => v !== 0) &&
-      !this.events.some((e) => e.plastic?.some((v) => v !== 0))
+      !wouldFracture(this.tissue.prepareAnatomy(this.anchors)[hit.node], p.magnitude) &&
+      this.permanentPeak <= FRACTURE_LIMIT * 1.05
     ) {
-      // A live contact without retained damage is independent of other live
-      // endpoints. Prepare the identical fields off-thread; recoil/Newton and
-      // camera processing can respond immediately. Capture the selected rest
-      // node so moving skin cannot change the contact while work is queued.
+      // A live contact that breaks nothing adds no retained damage, so it is
+      // independent of other live endpoints. Prepare the identical fields
+      // off-thread; recoil/Newton and camera processing can respond immediately.
+      // Its endpoints are relative to rest: `step` draws them over whatever
+      // slight breaks the head already carries, which is all a live head keeps.
+      // Capture the selected rest node so moving skin cannot change the contact
+      // while work is queued.
       const input = { ...p, location: this.tissue.vertices[hit.node].p };
       const queuedAt = performance.now();
       let previewEvent = null,
         previewMs = null;
+      // This contact's report arrives with its endpoints. Do not leave the last
+      // one standing meanwhile: it may say a bone broke, and this blow broke none.
+      this.lastImpact = null;
       const queued = this.preparer.request(
         input,
         softness,
@@ -164,22 +200,23 @@ export class FaceImpactRig {
           if (result.stage === 'preview') {
             previewMs = performance.now() - queuedAt;
             previewEvent = result.event;
+            previewEvent.offThread = true;
             this.events.push(previewEvent);
           } else if (previewEvent && this.events.includes(previewEvent)) {
-            const from = {
-              target: previewEvent.target,
-              reactionTarget: previewEvent.reactionTarget,
-              combinedTarget: previewEvent.combinedTarget,
-            };
+            const from = Object.fromEntries(
+              BLEND.map((key) => [key, previewEvent[key]]),
+            );
             const { age, committed } = previewEvent;
             Object.assign(previewEvent, result.event, {
               age,
               committed,
               refinement: { from, elapsed: 0 },
             });
-          } else if (!previewEvent) this.events.push(result.event);
-          else return; // Never revive an expired preview after a delayed solve.
-          if (this.events.length > 12) this.events.shift();
+          } else if (!previewEvent) {
+            result.event.offThread = true;
+            this.events.push(result.event);
+          } else return; // Never revive an expired preview after a delayed solve.
+          if (this.events.length > 12) this.retire(this.events.shift());
           this.lastImpact = {
             ...result.impact,
             preparationMs: result.milliseconds,
@@ -242,68 +279,141 @@ export class FaceImpactRig {
     this.gradientRig ??= new DeformationGradientRig(this.tissue);
     if (refine) this.gradientRig.refine(result.field);
     this.tissue.constrainAccumulation(result.field);
-    const permanent = (this.mode === 'clay' ? result.field : result.damage).slice();
+    const live = this.mode === 'live';
+    // Clay keeps the whole dent. A live head keeps only a break (src/bone-fracture.js):
+    // the plate gives way with the blow, and the swelling comes up after it.
+    const permanent = (live ? result.damage : result.field).slice();
+    const swelling = live && result.swelling ? result.swelling.slice() : null;
     const reserved = this.permanent.slice();
     for (const e of this.events)
       for (let i = 0; i < reserved.length; i++)
-        reserved[i] += e.plastic[i] * (1 - e.committed);
-    this.tissue.fitIncrement(reserved, permanent);
-    let reaction = null;
-    if (this.mode === 'live' && this.reactionEnabled) {
-      this.painExpression ??= new PainExpression(this.tissue);
-      reaction = this.painExpression.build(this.anchors, point, p.magnitude);
+        reserved[i] +=
+          e.plastic[i] * (1 - e.committed) +
+          (e.swelling ? e.swelling[i] * (1 - e.swollen) : 0);
+    // However often it is hit, a live head stays only slightly out of shape. Dents
+    // it already carries (clay, then switched to live) are never squashed to fit.
+    const limit = live
+      ? Math.max(FRACTURE_LIMIT, peakOf(reserved))
+      : MAX_PERMANENT_DISPLACEMENT;
+    this.tissue.fitIncrement(reserved, permanent, limit);
+    // What the head keeps as soon as this blow has landed, and `swollen`, what it
+    // keeps once the swelling is up. The dent, the flinch and the grimace are
+    // drawn over the first; by the time it aches the swelling has mostly come.
+    const base = reserved.slice();
+    for (let i = 0; i < base.length; i++) base[i] += permanent[i];
+    let swollen = base;
+    if (swelling) {
+      this.tissue.fitIncrement(base, swelling, limit);
+      swollen = base.slice();
+      for (let i = 0; i < swollen.length; i++) swollen[i] += swelling[i];
+    }
+    let poses = null,
+      pain = null;
+    if (live && this.reactionEnabled) {
+      this.painExpression ??= new PainRig(this.tissue);
+      const fractured = !!result.fracture;
+      poses = this.painExpression.build(this.anchors, point, p.magnitude, fractured);
+      // The pivot `FaceDynamics.applyRecoil` turns the head about.
+      const a = this.anchors,
+        arm = [
+          point[0] - a[13][0],
+          point[1] - a[159][1] + 0.025,
+          point[2] - a[13][2] + 0.075,
+        ],
+        d = p.direction;
+      pain = {
+        magnitude: p.magnitude,
+        fractured,
+        head: headFlinch(
+          [
+            arm[1] * d[2] - arm[2] * d[1],
+            arm[2] * d[0] - arm[0] * d[2],
+            arm[0] * d[1] - arm[1] * d[0],
+          ],
+          d,
+          p.magnitude,
+          fractured,
+        ),
+      };
     }
     this.events.push({
       age: 0,
       field: result.field,
       plastic: permanent,
+      swelling,
+      swollen: 0,
       mode: this.mode,
       committed: 0,
-      reaction,
+      // The pain rig's three poses; `reaction` is the grimace, its crest.
+      reaction: poses?.grimace ?? null,
+      flinch: poses?.flinch ?? null,
+      ache: poses?.ache ?? null,
+      pain,
     });
     // Precompute bounded live endpoints once per impact. Every animation frame
     // then blends valid endpoints; no surface solve is needed during playback.
+    // Each is checked where it will be drawn, over everything the head is going
+    // to keep, and stored relative to that, so `step` can lay it over a break
+    // that is still setting. Endpoints prepared off-thread never met a base.
+    const damaged = swollen.some((v) => v !== 0);
     for (const e of this.events) {
-      if (e.mode !== 'live') continue;
+      if (e.mode !== 'live' || e.offThread) continue;
       e.target = new Float32Array(rest.length);
       for (let i = 0; i < rest.length; i++)
-        e.target[i] = reserved[i] + permanent[i] + e.field[i] - e.plastic[i];
-      if (reserved.some((v) => v !== 0) || permanent.some((v) => v !== 0))
+        e.target[i] = base[i] + e.field[i] - e.plastic[i];
+      if (damaged)
         this.tissue.constrainAccumulation(e.target, MAX_PERMANENT_DISPLACEMENT);
-      if (e.reaction) {
-        e.reactionTarget = new Float32Array(rest.length);
-        e.combinedTarget = new Float32Array(rest.length);
-        for (let i = 0; i < rest.length; i++) {
-          e.reactionTarget[i] = reserved[i] + permanent[i] + e.reaction[i];
-          e.combinedTarget[i] = e.target[i] + e.reaction[i];
-        }
-        for (const field of [e.reactionTarget, e.combinedTarget]) {
-          // Eyelid contraction must not be suppressed by the impact field's
-          // isotropic stretch clamp. Protect orientation and displacement here.
-          for (let i = 0; i < field.length; i += 3) {
-            const length = Math.hypot(field[i], field[i + 1], field[i + 2]);
-            if (length > MAX_PERMANENT_DISPLACEMENT)
-              for (let j = 0; j < 3; j++)
-                field[i + j] *= MAX_PERMANENT_DISPLACEMENT / length;
+      const fields = [[e.target, base]];
+      if (e.reaction)
+        for (const [pose, alone, combined] of [
+          ['flinch', 'flinchTarget', 'flinchCombined'],
+          ['reaction', 'reactionTarget', 'combinedTarget'],
+          ['ache', 'acheTarget'],
+        ]) {
+          const under = combined ? base : swollen;
+          const made = [(e[alone] = new Float32Array(rest.length))];
+          if (combined) made.push((e[combined] = new Float32Array(rest.length)));
+          for (let i = 0; i < rest.length; i++) {
+            e[alone][i] = under[i] + e[pose][i];
+            if (combined) e[combined][i] = e.target[i] + e[pose][i];
           }
-          this.tissue.validity.constrain(field, 0.12);
+          for (const field of made) {
+            // Eyelid contraction must not be suppressed by the impact field's
+            // isotropic stretch clamp. Protect orientation and displacement here.
+            for (let i = 0; i < field.length; i += 3) {
+              const length = Math.hypot(field[i], field[i + 1], field[i + 2]);
+              if (length > MAX_PERMANENT_DISPLACEMENT)
+                for (let j = 0; j < 3; j++)
+                  field[i + j] *= MAX_PERMANENT_DISPLACEMENT / length;
+            }
+            this.tissue.validity.constrain(field, 0.12);
+          }
+          fields.push(...made.map((field) => [field, under]));
         }
-      }
+      if (damaged)
+        for (const [field, under] of fields)
+          for (let i = 0; i < field.length; i++) field[i] -= under[i];
     }
-    // Finish plastic commitments before retiring an event under sustained input.
-    if (this.events.length > 12) {
-      const e = this.events.shift();
-      for (let i = 0; i < this.permanent.length; i++)
-        this.permanent[i] += e.plastic[i] * (1 - e.committed);
-    }
+    if (this.events.length > 12) this.retire(this.events.shift());
     this.lastImpact = {
       ...p,
       regionBoneWeight: result.material.bone,
+      fracture: live ? result.fracture : null,
       gradientSolve: refine ? this.gradientRig.lastSolve : null,
-      painReaction: !!reaction,
+      painReaction: !!poses,
       affected: result.affected,
     };
     return result.affected;
+  }
+
+  // Finish what an event still owes the head before dropping it under sustained
+  // input: the rest of its dent or break, and swelling that had yet to come up.
+  retire(e) {
+    if (!e.plastic) return;
+    for (let i = 0; i < this.permanent.length; i++)
+      this.permanent[i] +=
+        e.plastic[i] * (1 - e.committed) +
+        (e.swelling ? e.swelling[i] * (1 - e.swollen) : 0);
   }
 
   get permanentPeak() {
@@ -557,50 +667,70 @@ export class FaceImpactRig {
         for (let i = 0; i < this.permanent.length; i++)
           this.permanent[i] += e.plastic[i] * delta;
         e.committed = onset;
+        if (e.swelling) {
+          const swollen = smooth(0.25, SWELL_SECONDS, e.age),
+            rise = swollen - e.swollen;
+          if (rise > 0)
+            for (let i = 0; i < this.permanent.length; i++)
+              this.permanent[i] += e.swelling[i] * rise;
+          e.swollen = swollen;
+        }
       }
       this.offset.set(this.permanent);
+      this.headPose.x = this.headPose.y = this.headPose.z = 0;
+      this.gasp = 0;
+      // Contact and the pain rig's poses keep separate clocks. The weights are
+      // nonnegative and sum to at most one, so every frame is a blend of
+      // endpoints that were each checked, laid over what the head has kept.
       const live = this.events.filter((e) => e.mode === 'live'),
         weights = live.map((e) => {
-          const contact = this.envelope(e.age),
-            reaction = e.reaction ? painEnvelope(e.age) : 0;
+          const contact = this.envelope(e.age);
+          if (!e.reaction) return [contact, 0, 0, 0, 0, 0];
+          const { magnitude, fractured, head } = e.pain,
+            pose = painTimeline(e.age, magnitude, fractured),
+            turn = headFlinchCurve(e.age, magnitude, fractured);
+          for (const axis of ['x', 'y', 'z']) this.headPose[axis] += head[axis] * turn;
+          this.gasp = Math.max(this.gasp, painGasp(e.age, magnitude, fractured));
           return [
-            contact * (1 - reaction),
-            contact * reaction,
-            (1 - contact) * reaction,
+            contact * (1 - pose.flinch - pose.grimace - pose.ache),
+            contact * pose.flinch,
+            (1 - contact) * pose.flinch,
+            contact * pose.grimace,
+            (1 - contact) * pose.grimace,
+            pose.ache,
           ];
         });
+      // FaceFusion's `limit_angle`: several blows turn the head no further than one.
+      limitHeadPose(this.headPose);
       const normalization = Math.max(
         1,
-        weights.reduce((a, b) => a + b[0] + b[1] + b[2], 0),
+        weights.reduce((sum, list) => list.reduce((a, b) => a + b, sum), 0),
       );
       live.forEach((e, index) => {
         const from = e.refinement?.from;
         const mix = from ? smooth(0, 0.04, e.refinement.elapsed) : 1;
-        for (let i = 0; i < this.offset.length; i++)
-          this.offset[i] +=
-            (((from
-              ? from.target[i] + (e.target[i] - from.target[i]) * mix
-              : e.target[i]) -
-              this.permanent[i]) *
-              weights[index][0] +
-              (e.reaction
-                ? ((from
-                    ? from.combinedTarget[i] +
-                      (e.combinedTarget[i] - from.combinedTarget[i]) * mix
-                    : e.combinedTarget[i]) -
-                    this.permanent[i]) *
-                    weights[index][1] +
-                  ((from
-                    ? from.reactionTarget[i] +
-                      (e.reactionTarget[i] - from.reactionTarget[i]) * mix
-                    : e.reactionTarget[i]) -
-                    this.permanent[i]) *
-                    weights[index][2]
-                : 0)) /
-            normalization;
+        BLEND.forEach((key, k) => {
+          const weight = weights[index][k] / normalization;
+          if (!(weight > 0)) return;
+          const to = e[key],
+            start = from?.[key];
+          if (start)
+            for (let i = 0; i < this.offset.length; i++)
+              this.offset[i] += (start[i] + (to[i] - start[i]) * mix) * weight;
+          else
+            for (let i = 0; i < this.offset.length; i++)
+              this.offset[i] += to[i] * weight;
+        });
       });
       this.events = this.events.filter(
-        (e) => e.age < (e.mode === 'clay' ? 0.12 : e.reaction ? 1.65 : 1.02),
+        (e) =>
+          e.age <
+          (e.mode === 'clay'
+            ? 0.12
+            : Math.max(
+                e.reaction ? painDuration(e.pain.magnitude, e.pain.fractured) : 1.02,
+                e.swelling ? SWELL_SECONDS : 0,
+              )),
       );
       return;
     }
@@ -624,6 +754,8 @@ export class FaceImpactRig {
     this.events = [];
     this.offset.fill(0);
     this.permanent.fill(0);
+    this.headPose.x = this.headPose.y = this.headPose.z = 0;
+    this.gasp = 0;
     this.lastImpact = null;
   }
 }

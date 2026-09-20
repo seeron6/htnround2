@@ -13,6 +13,12 @@ from urllib.parse import parse_qs
 from urllib.request import Request, urlopen
 from PIL import Image, ImageChops, ImageFilter
 
+# Optional Sentry tracing (SPONSOR_SETUP.md). A no-op without a DSN; absent entirely is fine too.
+try:
+    import sponsor_obs
+except ImportError:
+    sponsor_obs = None
+
 ROOT = Path(__file__).resolve().parent
 CONFIG = ROOT / '.local/secrets/meshy.json'
 ROUTES = {
@@ -337,8 +343,17 @@ class MeshyEngine:
                 }
             )
             atomic(folder / 'meshy/job.json', state)
+            # The build outlives the request that started it by minutes. traced() keeps it in that
+            # request's trace as its own transaction, with a span per stage (see update() below).
+            run = (
+                sponsor_obs.traced(
+                    self._run, 'meshy.build', op='job.meshy', resumed=bool(resume)
+                )
+                if sponsor_obs
+                else self._run
+            )
             worker = threading.Thread(
-                target=self._run, args=(identifier, folder, state), daemon=True
+                target=run, args=(identifier, folder, state), daemon=True
             )
             self.active[identifier] = worker
         worker.start()
@@ -346,6 +361,8 @@ class MeshyEngine:
     def _run(self, identifier, folder, state):
         def update(**changes):
             state.update(changes)
+            if sponsor_obs:
+                sponsor_obs.job_state(state)
             if not folder.is_dir():
                 raise FileNotFoundError  # the scan was deleted; stop quietly
             (folder / 'meshy').mkdir(exist_ok=True)
@@ -394,8 +411,12 @@ class MeshyEngine:
             pass
         except ValueError as exc:
             self._fail(update, str(exc))
-        except Exception:
+        except Exception as exc:
             traceback.print_exc()
+            if sponsor_obs:
+                sponsor_obs.capture(
+                    exc, {'feature': 'meshy', 'stage': state.get('stage')}
+                )
             self._fail(
                 update, 'The Meshy build failed unexpectedly. See the server log.'
             )

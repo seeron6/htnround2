@@ -24,7 +24,8 @@
 import * as THREE from 'three';
 import {ensureFaceDetector} from './hands.js';
 
-const ANCHOR_KEYS=[1,13,14,50,61,152,159,280,291,386];
+// 78 and 308 are the INNER mouth corners, where the lip seam ends (src/lip-fit.js).
+const ANCHOR_KEYS=[1,13,14,50,61,78,152,159,280,291,308,386];
 // The mouth aperture contour, in ring order.
 export const INNER_LIP=[78,191,80,81,82,13,312,311,310,415,308,324,318,402,317,14,87,178,88,95];
 const RENDER_SIZE=512;
@@ -42,10 +43,13 @@ const FACE_FRAMING=1.5;
 let lastRender=null;
 export const lastDetectorRender=()=>lastRender;
 
-export async function detectFaceOnMesh({renderer,scene,mesh,headPivot,size=RENDER_SIZE,debug=false}){
+export async function detectFaceOnMesh({renderer,scene,mesh,headPivot,size=RENDER_SIZE,debug=false,prepare=null}){
   if(!renderer||!scene||!mesh||!headPivot)return null;
   let detector;
   try{detector=await ensureFaceDetector();}catch{return null;}
+  // Last chance to put the head in the pose it should be measured in. It has to
+  // happen here: frames keep rendering while the detector loads.
+  prepare?.();
 
   mesh.updateMatrixWorld(true);
   mesh.geometry.computeBoundingBox();

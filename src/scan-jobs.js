@@ -45,6 +45,20 @@ async function poll(job) {
     job.retries = 0;
     const saved = job.engine === 'meshy' ? state.model : state.photoModel;
     if (state.status === 'complete' && saved) {
+      if (
+        job.engine === 'local' &&
+        state.source?.uploadStartedAt &&
+        !state.timing?.readyObservedAt
+      ) {
+        // Include the actual readiness poll even when the capture dialog is closed.
+        // Timing persistence must never prevent the finished head from being offered.
+        void fetch('/api/face-timing', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: job.id, kind: 'ready', at: Date.now() / 1000 }),
+          signal: AbortSignal.timeout(5000),
+        }).catch(() => {});
+      }
       job.status = 'complete';
       job.progress = 100;
       window.dispatchEvent(new CustomEvent('punching-face-library-changed'));
@@ -139,7 +153,8 @@ export function installScanJobs({
   function prompt(job) {
     if (dialog.open || swapping || document.hidden || !canPrompt()) return;
     shown = job;
-    status.textContent = job.engine === 'meshy' ? 'Meshy head' : 'Scanned head';
+    status.textContent =
+      job.name || (job.engine === 'meshy' ? 'Meshy head' : 'Scanned head');
     onPrompt(true);
     dialog.showModal();
   }

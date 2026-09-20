@@ -1,17 +1,31 @@
 import { installDemoHUD } from './demo-hud.js';
-import { listSavedHeads } from './model-library.js';
+import { listSavedHeads, renameHead } from './model-library.js';
+import { requestHeadName } from './head-name.js';
+import { ForwardPunchStart } from './forward-punch-start.js';
 import { installScanJobs, acknowledgeScanJob } from './scan-jobs.js';
+import {
+  GuardReadyHold,
+  GUARD_FRAME_MAX_AGE_MS,
+  GUARD_HOLD_MS,
+  handsInGuardTargets,
+} from './guard-readiness.js';
 import './demo-flow.css';
 
 // The demo is a small UI layer over the same model, camera and physics controls.
 export function installDemoFlow(api) {
   const $ = (id) => document.getElementById(id);
+  const setText = (id, text) => {
+    const element = $(id);
+    if (element.textContent !== text) element.textContent = text;
+  };
   let screen = 'welcome';
   let selection = 'demo';
   let selectedCapture = null;
   let loading = false;
   let awaitingImport = false;
   let calibrationTimer = null;
+  const guardHold = new GuardReadyHold();
+  let calibrationError = '';
   let cameraStarting = false;
   let keyboardOnly = false;
   let focused = false;
@@ -67,8 +81,23 @@ export function installDemoFlow(api) {
     <section data-screen="calibration" hidden>
       <h1 id="demo-calibration-title">Calibrate your guard.</h1>
       <p class="demo-subtitle">
-        Face the webcam and hold your open hands up in a comfortable guard.
+        Face the webcam and hold both fists inside the marked areas for 3 seconds.
       </p>
+      <div class="demo-arm-choices">
+        <label for="demo-arm-mode">Choose your arms</label>
+        <select id="demo-arm-mode">
+          <option value="wireframe">1 · Skeleton arms (original)</option>
+          <option value="live">2 · Live CV arms (Jace)</option>
+          <option value="preset">3 · My 3D arms (quick scan / presets)</option>
+        </select>
+        <button id="demo-scan-arms" class="demo-secondary" data-action="scan-arms">
+          Scan / customize my arms · optional
+        </button>
+        <p>
+          Use the original skeleton, live arm cutouts, or personalize first-person 3D
+          presets.
+        </p>
+      </div>
       <div class="demo-camera-frame">
         <video
           id="demo-camera-preview"
@@ -85,6 +114,26 @@ export function installDemoFlow(api) {
       <p id="demo-calibration-status" class="demo-status" role="status">
         Allow camera access when your browser asks.
       </p>
+      <div id="demo-guard-ready" hidden>
+        <div
+          id="demo-guard-progress"
+          role="progressbar"
+          aria-label="Ready to calibrate your guard"
+          aria-valuemin="0"
+          aria-valuemax="100"
+          aria-valuenow="0"
+        >
+          <svg viewBox="0 0 64 64" aria-hidden="true">
+            <circle class="demo-ready-track" cx="32" cy="32" r="27" />
+            <circle id="demo-ready-fill" cx="32" cy="32" r="27" pathLength="100" />
+          </svg>
+          <span id="demo-ready-seconds" aria-hidden="true">3</span>
+        </div>
+        <div class="demo-ready-copy">
+          <strong>Ready</strong>
+          <span id="demo-ready-hint">Hold both fists in the areas</span>
+        </div>
+      </div>
       <button id="demo-calibrate" class="demo-primary" data-action="calibrate" disabled>
         Calibrate my guard
       </button>
@@ -114,6 +163,12 @@ export function installDemoFlow(api) {
     </footer>
   `;
   document.body.append(dialog);
+  $('demo-arm-mode').value = api.getArmMode();
+  $('demo-arm-mode').onchange = () => api.setArmMode($('demo-arm-mode').value);
+  window.addEventListener('punching-face-arm-mode', () => {
+    $('demo-arm-mode').value = api.getArmMode();
+  });
+  const forwardPunchStart = new ForwardPunchStart($('demo-camera-preview'));
 
   const hud = installDemoHUD({
     setMode(mode) {
@@ -176,8 +231,11 @@ export function installDemoFlow(api) {
   }
 
   function stopCalibrationPreview() {
-    clearInterval(calibrationTimer);
+    cancelAnimationFrame(calibrationTimer);
     calibrationTimer = null;
+    guardHold.reset();
+    forwardPunchStart.reset();
+    calibrationError = '';
     $('demo-camera-preview').srcObject = null;
   }
 
@@ -267,7 +325,7 @@ export function installDemoFlow(api) {
           : '';
         select.add(
           new Option(
-            `${model.name || `Saved head ${i + 1}`} · ${date || model.id.slice(0, 8)}`,
+            `${model.name || `Saved head ${i + 1}`}${models.some((other) => other.id === model.id && other.engine !== model.engine) ? ` · ${model.engine === 'meshy' ? 'Meshy' : 'Local'}` : ''} · ${date || model.id.slice(0, 8)}`,
             model.key,
           ),
         );
@@ -276,7 +334,20 @@ export function installDemoFlow(api) {
       select.value = selectedCapture.key;
       select.onchange = () =>
         (selectedCapture = models.find((model) => model.key === select.value));
-      box.append(label, select);
+      const rename = document.createElement('button');
+      rename.type = 'button';
+      rename.className = 'demo-secondary';
+      rename.textContent = 'Rename';
+      rename.onclick = async () => {
+        const model = selectedCapture;
+        if (!model || loading) return;
+        await requestHeadName({
+          name: model.name,
+          rename: true,
+          save: (name) => renameHead(model.id, name),
+        });
+      };
+      box.append(label, select, rename);
       if (selection === 'saved') $('demo-use-model').disabled = false;
     } catch (error) {
       box.textContent = error.message;
@@ -301,6 +372,11 @@ export function installDemoFlow(api) {
 
   function syncCalibration() {
     if (screen !== 'calibration' || !dialog.open) return;
+    if (api.isArmScanOpen()) {
+      guardHold.reset();
+      forwardPunchStart.reset();
+      return;
+    }
     const state = api.getTracking();
     const video = $('demo-camera-preview');
     if (state.stream && video.srcObject !== state.stream) {
@@ -308,29 +384,99 @@ export function installDemoFlow(api) {
       video.play().catch(() => {});
     }
     const calibrated = state.active && state.calibrated;
+    const now = performance.now();
+    const handCount =
+      state.active &&
+      Number.isFinite(state.timestamp) &&
+      now - state.timestamp <= GUARD_FRAME_MAX_AGE_MS
+        ? state.handCount
+        : 0;
+    const targets = [...dialog.querySelectorAll('.demo-camera-guide span')];
+    const occupied = handsInGuardTargets(
+      handCount ? (state.landmarks ?? []) : [],
+      { width: video.videoWidth, height: video.videoHeight },
+      video.getBoundingClientRect(),
+      targets.map((target) => target.getBoundingClientRect()),
+    );
+    const ready =
+      state.active &&
+      !calibrated &&
+      !document.hidden &&
+      !cameraStarting &&
+      handCount === 2 &&
+      occupied.every(Boolean);
+    const { progress, complete } = guardHold.update(ready, state.timestamp, now);
+    targets.forEach((target, index) =>
+      target.classList.toggle('is-ready', occupied[index]),
+    );
+    const readyBox = $('demo-guard-ready');
+    readyBox.hidden = !state.active || calibrated;
+    readyBox.classList.toggle('is-ready', ready);
+    $('demo-ready-fill').style.strokeDashoffset = String(100 * (1 - progress));
+    const seconds = Math.max(1, Math.ceil(((1 - progress) * GUARD_HOLD_MS) / 1000));
+    setText('demo-ready-seconds', String(seconds));
+    $('demo-guard-progress').setAttribute(
+      'aria-valuenow',
+      String(Math.round(progress * 100)),
+    );
+    $('demo-guard-progress').setAttribute(
+      'aria-valuetext',
+      ready
+        ? `${seconds} second${seconds === 1 ? '' : 's'} until guard calibration`
+        : 'Waiting for both hands in the marked areas',
+    );
+    setText('demo-ready-hint', ready ? 'Hold steady…' : 'Hold both fists in the areas');
     $('demo-begin').hidden = !calibrated;
     $('demo-calibrate').hidden = calibrated || !state.active;
-    $('demo-calibrate').disabled = !state.handCount;
+    $('demo-calibrate').disabled = !handCount;
     $('demo-retry-camera').hidden = state.active || cameraStarting;
-    $('demo-camera-badge').textContent = calibrated
-      ? 'GUARD CALIBRATED'
-      : state.active
-        ? `${state.handCount} HAND${state.handCount === 1 ? '' : 'S'} DETECTED`
-        : cameraStarting
-          ? 'STARTING CAMERA…'
-          : 'CAMERA OFF';
-    $('demo-calibration-title').textContent = calibrated
-      ? 'Ready.'
-      : 'Calibrate your guard.';
-    $('demo-calibration-status').textContent = calibrated
-      ? 'Guard locked in. Throw a left hook, right hook, or uppercut.'
-      : state.active
-        ? state.handCount
-          ? 'Hands found. Hold your guard and press Calibrate.'
-          : 'Show an open hand in the frame so we can find your guard.'
-        : cameraStarting
-          ? 'Allow camera access. Hand tracking may take a moment to get ready.'
-          : 'Camera unavailable. Allow access and retry, or continue with your keyboard.';
+    setText(
+      'demo-camera-badge',
+      calibrated
+        ? 'GUARD CALIBRATED'
+        : state.active
+          ? `${handCount} HAND${handCount === 1 ? '' : 'S'} DETECTED`
+          : cameraStarting
+            ? 'STARTING CAMERA…'
+            : 'CAMERA OFF',
+    );
+    setText('demo-calibration-title', calibrated ? 'Ready.' : 'Calibrate your guard.');
+    setText(
+      'demo-calibration-status',
+      calibrated
+        ? 'Guard locked in. Punch forward to start, or select Begin punching.'
+        : calibrationError ||
+            (state.active
+              ? ready
+                ? 'Both hands in position. Keep your guard up to calibrate automatically.'
+                : 'Place one fist in each marked area. Hold for 3 seconds to calibrate.'
+              : cameraStarting
+                ? 'Allow camera access. Hand tracking may take a moment to get ready.'
+                : 'Camera unavailable. Allow access and retry, or continue with your keyboard.'),
+    );
+    if (forwardPunchStart.update(state, now, !document.hidden && !cameraStarting)) {
+      begin();
+      return;
+    }
+    if (complete) calibrateGuard();
+  }
+
+  function calibrateGuard() {
+    try {
+      api.calibrate();
+      calibrationError = '';
+      syncCalibration();
+      if (!$('demo-begin').hidden) $('demo-begin').focus();
+    } catch (error) {
+      calibrationError = error.message;
+      $('demo-calibration-status').textContent = calibrationError;
+    }
+  }
+
+  function calibrationFrame() {
+    syncCalibration();
+    if (screen === 'calibration' && dialog.open)
+      calibrationTimer = requestAnimationFrame(calibrationFrame);
   }
 
   async function calibrateScreen() {
@@ -338,9 +484,10 @@ export function installDemoFlow(api) {
     keyboardOnly = false;
     cameraStarting = true;
     syncCalibration();
-    calibrationTimer = setInterval(syncCalibration, 250);
+    calibrationTimer = requestAnimationFrame(calibrationFrame);
     try {
       await api.startCamera();
+      void api.prepareArms();
     } finally {
       cameraStarting = false;
       if (keyboardOnly) api.stopCamera();
@@ -387,15 +534,8 @@ export function installDemoFlow(api) {
     if (action === 'choose') show('models');
     if (action === 'use-model') void useModel();
     if (action === 'retry-camera') void calibrateScreen();
-    if (action === 'calibrate') {
-      try {
-        api.calibrate();
-        syncCalibration();
-        $('demo-begin').focus();
-      } catch (error) {
-        $('demo-calibration-status').textContent = error.message;
-      }
-    }
+    if (action === 'calibrate') calibrateGuard();
+    if (action === 'scan-arms') void api.openArmScan();
     if (action === 'begin') begin();
     if (action === 'keyboard') {
       keyboardOnly = true;
@@ -413,6 +553,12 @@ export function installDemoFlow(api) {
   dialog.addEventListener('cancel', (event) => {
     event.preventDefault();
     advanced();
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      guardHold.reset();
+      forwardPunchStart.reset();
+    }
   });
   window.addEventListener('punching-face-model-loaded', async () => {
     if (!awaitingImport) return;

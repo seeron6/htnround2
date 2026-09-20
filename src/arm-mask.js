@@ -1,4 +1,5 @@
-// Loaded two ways: bundled for tests, and imported by URL from public/pov-worker.js, which has to
+// Adapted from akashngb/punching-face, jace/cv at d0c1763.
+// Loaded two ways: bundled for tests, and imported by URL from public/arm-view-worker.js, which has to
 // stay a classic worker so MediaPipe's WASM loader can use importScripts. Vite inlines this file
 // for the `?url` import, so it must stay dependency-free.
 export const LINKS = [
@@ -26,7 +27,6 @@ export const LINKS = [
 ];
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
-const FALLBACK_ALPHA = 165;
 
 export function handScale(landmarks) {
   if (landmarks?.length !== 21) return 0;
@@ -47,7 +47,7 @@ function segmentDistance(point, a, b) {
   return Math.hypot(point.x - a.x - dx * t, point.y - a.y - dy * t);
 }
 
-function armGeometry(landmarks) {
+function armGeometry(landmarks, options = {}) {
   const scale = handScale(landmarks);
   if (!scale) return null;
   const wrist = landmarks[0],
@@ -75,11 +75,32 @@ function armGeometry(landmarks) {
   else if (dy < 0) candidates.push(-wrist.y / dy);
   const valid = candidates.filter((value) => Number.isFinite(value) && value > 0),
     travel = valid.length ? Math.min(...valid) : 1;
+  let end = { x: wrist.x + dx * travel, y: wrist.y + dy * travel };
+  let forearm = true;
+  if (options.strict && !options.firstPerson) {
+    // A front-facing camera sees the torso behind the arms. Never extrapolate a
+    // wrist ray through the shirt: stop at its matched, visible elbow instead.
+    const usable = (p) =>
+      p && Number.isFinite(p.x) && Number.isFinite(p.y) && (p.visibility ?? 1) >= 0.6;
+    const matches = [
+      [13, 15],
+      [14, 16],
+    ]
+      .map(([e, w]) => ({ elbow: options.pose?.[e], wrist: options.pose?.[w] }))
+      .filter(
+        (p) =>
+          usable(p.elbow) && usable(p.wrist) && distance(wrist, p.wrist) < scale * 0.9,
+      )
+      .sort((a, b) => distance(wrist, a.wrist) - distance(wrist, b.wrist));
+    forearm = !!matches.length;
+    end = forearm ? matches[0].elbow : wrist;
+  }
   return {
     landmarks,
     palm,
     wrist,
-    end: { x: wrist.x + dx * travel, y: wrist.y + dy * travel },
+    end,
+    forearm,
     scale,
   };
 }
@@ -149,26 +170,16 @@ export class ArmAnchor {
 // The multiclass model labels body skin and clothes but does not distinguish one arm from the
 // torso. Hand landmarks seed a hand skeleton and a tapered wrist-to-frame corridor, so only the
 // first-person arms attached to detected hands win. The hand region accepts any person pixel
-// (shadowed knuckles flicker between the segmenter's classes), and a tighter landmark-only core
-// keeps partial alpha even when segmentation misses the fist entirely — landmarks are the
-// trustworthy signal, so the fist may dim but never vanishes.
-export function armCutout(labels, width, height, hands, support, anchor) {
+// (shadowed knuckles flicker between the segmenter's classes). Landmarks select which arm to
+// keep; only the current segmentation defines its silhouette. Padding or a landmark-only disc
+// would reveal camera background around the fist instead of following its edge.
+export function armCutout(labels, width, height, hands, support, anchor, options = {}) {
   const alpha = new Uint8ClampedArray(width * height),
     person = new Uint8Array(alpha.length);
-  for (let y = 0; y < height; y++)
-    for (let x = 0; x < width; x++) {
-      const label = labels[y * width + x];
-      if (label !== 2 && label !== 4) continue;
-      for (let oy = -1; oy <= 1; oy++)
-        for (let ox = -1; ox <= 1; ox++) {
-          const px = x + ox,
-            py = y + oy;
-          if (px < 0 || px >= width || py < 0 || py >= height) continue;
-          person[py * width + px] = 1;
-        }
-    }
+  for (let i = 0; i < person.length; i++)
+    person[i] = labels[i] === 2 || labels[i] === 4 ? 1 : 0;
   const region = anchor ? anchor.update(person, width, height) : null;
-  const geometry = hands.map(armGeometry);
+  const geometry = hands.map((hand) => armGeometry(hand, options));
   // A hand whose landmarks sit nowhere near corner-connected person mass is the screen's copy of
   // an arm, not an arm: it contributes no shapes, no fallback core, and the page must not track it.
   const anchoredHands = geometry.map((arm) => {
@@ -216,38 +227,43 @@ export function armCutout(labels, width, height, hands, support, anchor) {
         if (alpha[index] === 255) continue;
         const p = { x: (x + 0.5) / width, y: (y + 0.5) / height };
         const backed = person[index] && (!region || region.connected[index]);
-        if (backed) {
-          const t = ((p.x - arm.wrist.x) * dx + (p.y - arm.wrist.y) * dy) / lengthSq;
-          if (
-            t >= -0.12 &&
-            t <= 1.04 &&
-            segmentDistance(p, arm.wrist, arm.end) <=
-              arm.scale * (0.42 + 0.55 * clamp(t, 0, 1))
-          ) {
-            alpha[index] = 255;
-            continue;
-          }
+        if (!backed) continue;
+        const t = ((p.x - arm.wrist.x) * dx + (p.y - arm.wrist.y) * dy) / lengthSq;
+        if (
+          arm.forearm &&
+          t >= -0.12 &&
+          t <= (options.strict ? 1 : 1.04) &&
+          segmentDistance(p, arm.wrist, arm.end) <=
+            arm.scale *
+              (options.strict
+                ? 0.32 + 0.14 * clamp(t, 0, 1)
+                : 0.42 + 0.55 * clamp(t, 0, 1)) &&
+          !(
+            options.strict &&
+            options.firstPerson &&
+            p.y > 0.7 &&
+            p.x > 0.38 &&
+            p.x < 0.62
+          )
+        ) {
+          alpha[index] = 255;
+          continue;
         }
-        let inHand = distance(p, arm.palm) <= arm.scale * (backed ? 0.72 : 0.6);
+        let inHand =
+          distance(p, arm.palm) <= arm.scale * (options.strict ? 0.48 : 0.72);
         if (!inHand) {
-          const reach = arm.scale * (backed ? 0.13 : 0.11);
+          const reach = arm.scale * 0.13;
           for (const [a, b] of LINKS)
             if (segmentDistance(p, arm.landmarks[a], arm.landmarks[b]) <= reach) {
               inHand = true;
               break;
             }
         }
-        if (inHand)
-          alpha[index] = backed ? 255 : Math.max(alpha[index], FALLBACK_ALPHA);
+        if (inHand) alpha[index] = 255;
       }
   }
-  // Sustain pass: hand detection is the least stable signal exactly where the guard lives — a
-  // fist half-clipped by the frame edge drops in and out of the landmarker — while the
-  // segmenter's person label for a big, close arm is steady. So landmarks only *bootstrap* an
-  // arm region; once established (in the smoothed history the worker passes back in), any person
-  // pixel touching that region stays lit even on frames with no detection at all. Growth is
-  // bounded to one mask-pixel per frame, so a still arm persists indefinitely and a slow-moving
-  // one is tracked, while nothing appears where landmarks never confirmed an arm.
+  // Brief dropout support may retain already-confirmed arm pixels, but must never
+  // dilate into connected clothing/torso. The worker expires support after 250 ms.
   if (support && support.length === alpha.length) {
     for (let y = 0; y < height; y++)
       for (let x = 0; x < width; x++) {
@@ -258,18 +274,7 @@ export function armCutout(labels, width, height, hands, support, anchor) {
           (region && !region.connected[index])
         )
           continue;
-        let near = false;
-        for (let oy = -1; oy <= 1 && !near; oy++)
-          for (let ox = -1; ox <= 1; ox++) {
-            const px = x + ox,
-              py = y + oy;
-            if (px < 0 || px >= width || py < 0 || py >= height) continue;
-            if (support[py * width + px] >= 80) {
-              near = true;
-              break;
-            }
-          }
-        if (near) alpha[index] = 255;
+        if (support[index] >= 80) alpha[index] = 255;
       }
   }
   return { alpha, anchored: anchoredHands };
@@ -301,13 +306,21 @@ export function arcCoverage(alpha, width, height, target, radius) {
   return inside ? lit / inside : 0;
 }
 
-// Asymmetric temporal filter: new arm pixels appear fast (punches stay responsive) while absent
-// pixels fade over a few frames, so single-frame segmenter flicker dims the mask instead of
-// carving holes in it.
+// Reject uncertain boundary pixels and feather inward, never into the camera background.
+// Combine skin and clothing confidence so sleeves and their seam remain part of the arm.
+export function refineArmEdges(alpha, skin, clothes) {
+  for (let i = 0; i < alpha.length; i++) {
+    const t = clamp((skin[i] + clothes[i] - 0.55) / 0.3, 0, 1);
+    alpha[i] *= t * t * (3 - 2 * t);
+  }
+  return alpha;
+}
+
+// New pixels ease in, but the current silhouette is always a hard upper bound. Fading old
+// pixels out would leave a visible trail of background behind a moving fist.
 export class MaskSmoother {
-  constructor({ attack = 0.65, decay = 0.3 } = {}) {
+  constructor({ attack = 0.65 } = {}) {
     this.attack = attack;
-    this.decay = decay;
     this.state = null;
   }
   apply(alpha) {
@@ -320,7 +333,7 @@ export class MaskSmoother {
       const target = alpha[i],
         current = state[i];
       const next =
-        current + (target - current) * (target > current ? this.attack : this.decay);
+        target > current ? current + (target - current) * this.attack : target;
       state[i] = next < 6 ? 0 : next;
     }
     return state;

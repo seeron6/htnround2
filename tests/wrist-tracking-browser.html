@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Camera wrist rotation review</title>
+    <style>
+      body {
+        margin: 0;
+        background: #eceeea;
+        color: #182820;
+        font: 16px system-ui;
+      }
+      header {
+        padding: 16px 24px;
+        display: flex;
+        gap: 20px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      label {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      #stage {
+        height: 72vh;
+      }
+      #status,
+      p {
+        margin: 12px 24px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <b>Third hand option · wrist tracking</b>
+      <label
+        >Roll
+        <input
+          id="roll"
+          aria-label="Wrist roll"
+          type="range"
+          min="-180"
+          max="180"
+          value="0"
+      /></label>
+      <label
+        >Bend
+        <input
+          id="bend"
+          aria-label="Wrist bend"
+          type="range"
+          min="-55"
+          max="55"
+          value="0"
+      /></label>
+      <label><input id="metric" type="checkbox" checked /> 3D camera landmarks</label>
+      <label><input id="legacy" type="checkbox" /> Reproduce disconnected wrist</label>
+      <label
+        >View
+        <select id="view">
+          <option value="pov">First person</option>
+          <option value="side">Side</option>
+        </select></label
+      >
+    </header>
+    <div id="stage"></div>
+    <p id="status" role="status">Loading…</p>
+    <p>
+      Synthetic camera frames → Tracking.tick → QuickArms.update → production skinned
+      arm. Hand position stays fixed while the palm rotates.
+    </p>
+    <script type="module">
+      import * as THREE from 'three';
+      import { Tracking, VirtualHand } from '/src/hands.js';
+      import { QuickArms } from '/src/quick-arms.js';
+      import { PresetArm } from '/src/preset-arm.js';
+      import { armFrame } from '/src/arm-kinematics.js';
+      import { wristObservation } from './helpers/wrist-tracking.mjs';
+      const $ = (id) => document.getElementById(id);
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color('#eceeea');
+      const camera = new THREE.PerspectiveCamera(52, 1, 0.01, 10);
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      $('stage').append(renderer.domElement);
+      scene.add(new THREE.HemisphereLight(0xfffaf3, 0x697269, 1.4));
+      const key = new THREE.DirectionalLight(0xffefdf, 2.7);
+      key.position.set(-1, 1.4, 0.8);
+      scene.add(key);
+      const fill = new THREE.DirectionalLight(0xd4e4ff, 0.9);
+      fill.position.set(1, 0.2, -0.7);
+      scene.add(fill);
+      const arms = [-1, 1].map(
+        (side) => new PresetArm(side, { style: 'bare', ring: true }),
+      );
+      const group = new THREE.Group();
+      group.add(...arms);
+      scene.add(group);
+      const quickArms = { arms, group, getMode: () => 'preset' };
+      const hands = [-1, 1].map((side) => new VirtualHand(side));
+      const tracking = new Tracking(
+        { videoWidth: 1280, videoHeight: 720, readyState: 0 },
+        () => {},
+      );
+      tracking.active = true;
+      const Y = new THREE.Vector3(0, 1, 0),
+        Z = new THREE.Vector3(0, 0, 1);
+      const bases = arms.map((a) =>
+        armFrame(a.anchors.wrist.clone().sub(a.anchors.elbow), Z),
+      );
+      const fixedImages = arms.map((a, i) => wristObservation(a.side, bases[i]).image);
+      const view = () => {
+        camera.position.set(
+          ...($('view').value === 'side' ? [0.85, -0.05, -0.3] : [0, 0.03, 0.12]),
+        );
+        camera.lookAt(0, -0.13, -0.35);
+      };
+      $('view').addEventListener('change', view);
+      view();
+      new ResizeObserver(() => {
+        const bounds = $('stage').getBoundingClientRect();
+        renderer.setSize(bounds.width, bounds.height);
+        camera.aspect = bounds.width / bounds.height;
+        camera.updateProjectionMatrix();
+      }).observe($('stage'));
+      let last = 0;
+      renderer.setAnimationLoop((now) => {
+        const dt = Math.min(0.04, Math.max(1 / 240, (now - last) / 1000));
+        last = now;
+        const poses = arms.map((a, i) =>
+          bases[i]
+            .clone()
+            .multiply(
+              new THREE.Quaternion().setFromAxisAngle(
+                Z,
+                (Number($('bend').value) * Math.PI) / 180,
+              ),
+            )
+            .multiply(
+              new THREE.Quaternion().setFromAxisAngle(
+                Y,
+                (Number($('roll').value) * Math.PI) / 180,
+              ),
+            ),
+        );
+        const samples = arms.map((a, i) => wristObservation(a.side, poses[i]));
+        tracking.tick(now, hands, {
+          timestamp: now,
+          landmarks: $('metric').checked ? fixedImages : samples.map((s) => s.image),
+          worldLandmarks: $('metric').checked ? samples.map((s) => s.world) : [],
+          handedness: [[{ categoryName: 'Left' }], [{ categoryName: 'Right' }]],
+        });
+        if ($('legacy').checked) hands.forEach((h) => (h.palmOrientation = null));
+        QuickArms.prototype.update.call(quickArms, hands, dt);
+        renderer.render(scene, camera);
+        const error = Math.max(
+          ...arms.map((a, i) => (a.palm.quaternion.angleTo(poses[i]) * 180) / Math.PI),
+        );
+        $('status').textContent =
+          `Roll ${$('roll').value}° · bend ${$('bend').value}° · palm error ${error.toFixed(2)}° · ${hands.filter((h) => h.tracked).length} hands tracked · ${renderer.info.render.triangles.toLocaleString()} triangles`;
+      });
+    </script>
+  </body>
+</html>

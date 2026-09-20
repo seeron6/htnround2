@@ -6,6 +6,15 @@ import { observe, makeRandom } from './helpers/synthetic-hand.mjs';
 
 const FACING = Math.PI / 2; // the synthetic hand's +y is wrist->knuckles; +90deg aims it at this camera
 
+test('shared results ignore stale and invalid timestamps without rewinding the trajectory', () => {
+  const tracking = new TargetTracking({ videoWidth: 640, videoHeight: 480 }, () => {});
+  tracking.consume({ timestamp: 1000, landmarks: [] }, 1008);
+  for (const timestamp of [999, 1000, NaN])
+    tracking.consume({ timestamp, landmarks: [] }, 1010);
+  assert.equal(tracking.counts.frames, 1);
+  assert.equal(tracking.appliedTimestamp, 1000);
+});
+
 function rig(options = {}) {
   const video = { videoWidth: 640, videoHeight: 480, readyState: 4 };
   const tracking = new TargetTracking(video, () => {}, { fovDegrees: 60, ...options });
@@ -23,6 +32,7 @@ function drive(
   at,
   {
     duration = 0.8,
+    start = 0,
     step = 1 / 60,
     seed = 5,
     vanishBelow = null,
@@ -82,9 +92,9 @@ function drive(
       worldLandmarks: gone ? [] : [o.worldLandmarks],
       handedness: gone ? [] : [[{ categoryName: shown, score: 0.95 }]],
       motion: { energy: motion, x: 0.5, y: 0.5, peak: 0.4, blobs },
-      timestamp: ms,
+      timestamp: ms + start,
     };
-    const contact = tracking.tick(ms + 10);
+    const contact = tracking.tick(ms + start + 10);
     if (contact) impacts.push(contact);
   }
   return impacts;
@@ -239,7 +249,9 @@ test('the motion stream carries a blur-dead punch to a confirmed apex through th
 test('left and right hands keep independent shape models', () => {
   const tracking = rig();
   drive(tracking, punch(), { label: 'Right', duration: 0.9 });
-  drive(tracking, punch(), { label: 'Left', seed: 11, duration: 0.9 });
+  // The first fist leaves before the other enters; timestamps remain monotonic.
+  tracking.consume({ timestamp: 2000, landmarks: [] }, 2008);
+  drive(tracking, punch(), { label: 'Left', seed: 11, duration: 0.9, start: 2100 });
   assert.equal(
     tracking.estimators.size,
     2,

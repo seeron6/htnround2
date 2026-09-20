@@ -9,7 +9,7 @@ from PIL import Image
 from scipy.spatial import cKDTree
 from scipy.interpolate import RBFInterpolator
 from scipy.ndimage import distance_transform_edt, map_coordinates
-from face_pipeline import atomic
+from face_pipeline import atomic, require_head_capture
 from scripts.head_material import rear_reference, missing_head_material
 from scripts.head_accessories import clean_view, build_glasses
 from scripts.eye_detail import apply_eye_material
@@ -446,10 +446,8 @@ def bake_photographs(
     output_folder=None,
 ):
     output_folder = folder if output_folder is None else output_folder
+    require_head_capture(json.loads((folder / 'capture.json').read_text()))
     detail_audit = prepare_detail_frames(folder)
-    head_capture = (
-        json.loads((folder / 'capture.json').read_text()).get('captureRegion') == 'head'
-    )
     import os
 
     size = int(os.environ.get('CONTACT_TEXTURE_SIZE', '3072'))
@@ -514,12 +512,9 @@ def bake_photographs(
     world = (B.T @ (texel / transform['scale'] + transform['center']).T).T + center
     world_n = (B.T @ tn.T).T
     verts_world = (B.T @ (p / transform['scale'] + transform['center']).T).T + center
-    # Neutral shading identifies the inferred cranium instead of inventing a
-    # hair/scalp texture for regions the camera never captured.
-    light = np.array([-0.3, 0.7, 1.0])
-    light /= np.linalg.norm(light)
-    shade = 0.6 + 0.4 * np.maximum(tn @ light, 0)
-    color = np.array([0.31, 0.38, 0.36])[None] * shade[:, None]
+    # Temporary working color; all unsupported surfaces receive completed
+    # skin/hair material below before the atlas can be published.
+    color = np.zeros((len(texel), 3))
     best = np.zeros(len(texel))
     hair_support = np.zeros(len(texel))
     total = np.zeros(len(texel))
@@ -544,7 +539,7 @@ def bake_photographs(
     yaw = lambda im: frames[im.name].get('cameraYaw', frames[im.name].get('yaw') or 0)
     facial = [im for im in train if frames[im.name].get('landmarks')]
     front = min(facial, key=lambda im: abs(yaw(im)))
-    targets = list(range(-180, 180, 20)) if head_capture else [-45, 0, 45]
+    targets = list(range(-180, 180, 20))
     from scripts.frame_evidence import assess_frames, choose_views
 
     view_quality = assess_frames(folder, output_folder=output_folder)
@@ -621,6 +616,9 @@ def bake_photographs(
             raise ValueError(
                 'No photograph has sufficient unmasked cheek coverage to establish skin color.'
             )
+    # Seed every texel from captured skin, including gaps on the front-to-side
+    # transition where frontal ownership can suppress inferred material.
+    color[:] = reference_color
     glasses = (
         build_glasses(p, completion, rec, frames, center, B, transform)
         if completion
@@ -671,9 +669,7 @@ def bake_photographs(
         facing = np.maximum(np.sum(view_normals * toward, axis=1), 0)
         # All contribution/ownership scores are zero behind the camera or
         # on back-facing surfaces. Keep positive grazing angles for cleanup.
-        near = np.flatnonzero(
-            (facing > 0) & (cp[:, 2] > 0) & (view_observed | head_capture)
-        )
+        near = np.flatnonzero((facing > 0) & (cp[:, 2] > 0))
         cp, facing = cp[near], facing[near]
         if sample_indices is not None:
             near = sample_indices[near]
@@ -751,7 +747,6 @@ def bake_photographs(
             & (ij[:, 1] >= 0)
             & (ij[:, 1] < h - 1)
             & (cp[:, 2] > 0)
-            & (observed | head_capture)
         )
         ij[:, 0] = np.clip(ij[:, 0], 0, w - 1)
         ij[:, 1] = np.clip(ij[:, 1], 0, h - 1)
@@ -1143,10 +1138,8 @@ def bake_photographs(
     workers = max(1, min(4, int(os.environ.get('CONTACT_BAKE_WORKERS', '4'))))
     from scripts.camera_texture import CameraTexture
 
-    ownership = (
-        CameraTexture(p, f, texel, parts, labels, surface_binding, views, completion)
-        if head_capture
-        else None
+    ownership = CameraTexture(
+        p, f, texel, parts, labels, surface_binding, views, completion
     )
     with ThreadPoolExecutor(workers, thread_name_prefix='photo-bake') as pool:
         # Batches bound both in-flight work and retained per-camera arrays.
@@ -1155,7 +1148,9 @@ def bake_photographs(
             for im, result in zip(batch, pool.map(project_view, batch)):
                 near, contributions, maxima, detail, fine, visible, audit = result
                 if ownership is not None:
-                    ownership.observe(im, near, contributions['total'])
+                    ownership.observe(
+                        im, near, contributions['total'], contributions['accum']
+                    )
                 for name, values in contributions.items():
                     sums[name][near] += values
                 for name, values in maxima.items():
@@ -1174,8 +1169,6 @@ def bake_photographs(
     if ownership is not None:
         revised_ids, revised_low, ownership_audit = ownership.reblend(
             views,
-            project_view,
-            workers,
             best,
             cleaned_coverage,
             hair_votes,
@@ -1216,117 +1209,114 @@ def bake_photographs(
             + clean_color[cleaned] * cleaned_coverage[cleaned, None]
         )
     supported_color_reference = None
-    if head_capture:
-        from scripts.texture_evidence import snapshot_supported_colors
+    from scripts.texture_evidence import snapshot_supported_colors
 
-        supported_color_reference = snapshot_supported_colors(
-            color, parts, best, cleaned_coverage, bottom
-        )
+    supported_color_reference = snapshot_supported_colors(
+        color, parts, best, cleaned_coverage, bottom
+    )
     rear_path = folder / 'rear-prediction/rear.png'
     inferred = ~observed & (best < 0.08)
-    rear = rear_reference(rear_path) if head_capture and rear_path.exists() else None
-    if head_capture:
-        # Use real photographed hair for missing-crown material, even when no
-        # generated rear reference exists. This is texture synthesis, not an
-        # additional measured viewpoint.
-        frame = frames[front.name]
-        photo = Image.open(folder / 'images' / front.name).convert('RGBA')
-        box = photo.getchannel('A').getbbox()
-        swatch = None
-        if frame.get('landmarks') and box:
-            forehead = frame['landmarks'][10]['y'] * photo.height
-            hair_h = forehead - box[1]
-            mid = (box[0] + box[2]) * 0.5
-            span = (box[2] - box[0]) * 0.23
-            if hair_h > 12:
-                patch = np.asarray(
-                    photo.crop(
-                        (
-                            int(mid - span),
-                            int(box[1] + hair_h * 0.08),
-                            int(mid + span),
-                            int(box[1] + hair_h * 0.70),
-                        )
+    rear = rear_reference(rear_path) if rear_path.exists() else None
+    # Use real photographed hair for missing-crown material, even when no
+    # generated rear reference exists. This is texture synthesis, not an
+    # additional measured viewpoint.
+    frame = frames[front.name]
+    photo = Image.open(folder / 'images' / front.name).convert('RGBA')
+    box = photo.getchannel('A').getbbox()
+    swatch = None
+    if frame.get('landmarks') and box:
+        forehead = frame['landmarks'][10]['y'] * photo.height
+        hair_h = forehead - box[1]
+        mid = (box[0] + box[2]) * 0.5
+        span = (box[2] - box[0]) * 0.23
+        if hair_h > 12:
+            patch = np.asarray(
+                photo.crop(
+                    (
+                        int(mid - span),
+                        int(box[1] + hair_h * 0.08),
+                        int(mid + span),
+                        int(box[1] + hair_h * 0.70),
                     )
                 )
-                rgb = patch[:, :, :3] / 255.0
-                valid = (patch[:, :, 3] > 200) & (rgb.mean(2) < 0.45)
-                if valid.any():
-                    _, near = distance_transform_edt(~valid, return_indices=True)
-                    rgb[~valid] = rgb[near[0][~valid], near[1][~valid]]
-                    swatch = rgb
-        from scripts.head_material import photographed_scalp_region
-        from scripts.rear_hair import rear_hair_swatches
+            )
+            rgb = patch[:, :, :3] / 255.0
+            valid = (patch[:, :, 3] > 200) & (rgb.mean(2) < 0.45)
+            if valid.any():
+                _, near = distance_transform_edt(~valid, return_indices=True)
+                rgb[~valid] = rgb[near[0][~valid], near[1][~valid]]
+                swatch = rgb
+    from scripts.head_material import photographed_scalp_region
+    from scripts.rear_hair import rear_hair_swatches
 
-        short_swatches, short_hair_audit = rear_hair_swatches(
-            folder, completion, frames, semantics
-        )
+    short_swatches, short_hair_audit = rear_hair_swatches(
+        folder, completion, frames, semantics
+    )
 
-        # Semantic visibility is independent of the sharper RGB-selection
-        # weight. Otherwise the prior paints hair onto visible temple skin.
-        scalp_override = photographed_scalp_region(
-            texel, p, completion, hair_votes, hair_visibility, hair_semantic_best
-        )
-        # Use physical photo support for the scalp; facial and ear ownership
-        # retain their existing, stricter thresholds.
-        scalp_support = np.where((~observed) & (parts == 0), hair_support, best)
-        scalp_override[ear_surface] = 0
-        inferred_rgb, scalp = missing_head_material(
-            texel,
-            tn,
-            p,
-            completion,
-            reference_color,
-            rear,
-            swatch,
-            scalp_override,
-            short_swatches,
-        )
-        # Discard grazing-angle projections smoothly: they carry little usable
-        # texture resolution and otherwise smear the side and crown.
-        weight = np.clip((0.12 - scalp_support) / 0.12, 0, 1) * (1 - frontal)
-        weight = weight * weight * (3 - 2 * weight)
-        original_weight = np.clip((0.12 - best) / 0.12, 0, 1) * (1 - frontal)
-        original_weight = original_weight * original_weight * (3 - 2 * original_weight)
-        weight *= 1 - smooth_region(estimated_best / 0.10)
-        weight *= 1 - cleaned_coverage
-        original_weight *= 1 - smooth_region(estimated_best / 0.10)
-        original_weight *= 1 - cleaned_coverage
-        # Ear observations already fade by physical support above. A tiny
-        # nonzero projection must not disable completion and retain black
-        # or stretched pixels on unseen folds.
-        # New support must use color from the SAME hair observations. The
-        # unrestricted blend may contain neck skin from another camera.
-        from scripts.hair_appearance import blend_hair_completion
+    # Semantic visibility is independent of the sharper RGB-selection
+    # weight. Otherwise the prior paints hair onto visible temple skin.
+    scalp_override = photographed_scalp_region(
+        texel, p, completion, hair_votes, hair_visibility, hair_semantic_best
+    )
+    # Use physical photo support for the scalp; facial and ear ownership
+    # retain their existing, stricter thresholds.
+    scalp_support = np.where((~observed) & (parts == 0), hair_support, best)
+    scalp_override[ear_surface] = 0
+    inferred_rgb, scalp = missing_head_material(
+        texel,
+        tn,
+        p,
+        completion,
+        reference_color,
+        rear,
+        swatch,
+        scalp_override,
+        short_swatches,
+    )
+    # Discard grazing-angle projections smoothly: they carry little usable
+    # texture resolution and otherwise smear the side and crown.
+    weight = np.clip((0.12 - scalp_support) / 0.12, 0, 1) * (1 - frontal)
+    weight = weight * weight * (3 - 2 * weight)
+    original_weight = np.clip((0.12 - best) / 0.12, 0, 1) * (1 - frontal)
+    original_weight = original_weight * original_weight * (3 - 2 * original_weight)
+    weight *= 1 - smooth_region(estimated_best / 0.10)
+    weight *= 1 - cleaned_coverage
+    original_weight *= 1 - smooth_region(estimated_best / 0.10)
+    original_weight *= 1 - cleaned_coverage
+    # Ear observations already fade by physical support above. A tiny
+    # nonzero projection must not disable completion and retain black
+    # or stretched pixels on unseen folds.
+    # New support must use color from the SAME hair observations. The
+    # unrestricted blend may contain neck skin from another camera.
+    from scripts.hair_appearance import blend_hair_completion
 
-        completed = blend_hair_completion(
-            color, inferred_rgb, hair_accum, hair_total, original_weight, weight
-        )
-        # Retain this fallback's contribution separately. Lower-skin harmonic
-        # completion can then replace it once, rather than blending through a
-        # bright cheek swatch a second time at intermediate confidence.
-        skin_completion_delta = completed - color
-        color = color + skin_completion_delta
-        from scripts.ear_appearance import hidden_scalp_completion
+    completed = blend_hair_completion(
+        color, inferred_rgb, hair_accum, hair_total, original_weight, weight
+    )
+    # Retain this fallback's contribution separately. Lower-skin harmonic
+    # completion can then replace it once, rather than blending through a
+    # bright cheek swatch a second time at intermediate confidence.
+    skin_completion_delta = completed - color
+    color = color + skin_completion_delta
+    from scripts.ear_appearance import hidden_scalp_completion
 
-        hidden_hair = hidden_scalp_completion(
-            ear_hidden_total,
-            total,
-            estimated_total,
-            scalp,
-            parts,
-            np.maximum(best, hair_support),
-        )
-        color = color * (1 - hidden_hair[:, None]) + inferred_rgb * hidden_hair[:, None]
-        skin_completion_delta *= 1 - hidden_hair[:, None]
+    hidden_hair = hidden_scalp_completion(
+        ear_hidden_total,
+        total,
+        estimated_total,
+        scalp,
+        parts,
+        np.maximum(best, hair_support),
+    )
+    color = color * (1 - hidden_hair[:, None]) + inferred_rgb * hidden_hair[:, None]
+    skin_completion_delta *= 1 - hidden_hair[:, None]
     # A complete template contains hidden mouth surfaces and the backs of the
     # eyeballs. Those are not failed facial photographs. Measure coverage on
     # the exposed surface and give hidden internal anatomy a neutral material.
     exposed = observed & visible_any & (parts == 0) & measured_face_footprint(texel, p)
     interior = observed & ~visible_any & (parts == 0)
     color[interior] = reference_color * 0.65
-    if head_capture:
-        skin_completion_delta[interior] = 0
+    skin_completion_delta[interior] = 0
     mouth = (
         interior
         & (texel[:, 1] < p[13, 1] + 0.006)
@@ -1352,39 +1342,37 @@ def bake_photographs(
         supported = exposed & ~missing
         _, closest = cKDTree(texel[supported]).query(texel[missing])
         color[missing] = color[supported][closest]
-        if head_capture:
-            skin_completion_delta[missing] = 0
+        skin_completion_delta[missing] = 0
     lower_skin_texels = 0
     ear_skin_texels = 0
     lower_surface = None
-    if head_capture:
-        from scripts.skin_continuation import continue_lower_skin, continue_ear_skin
+    from scripts.skin_continuation import continue_lower_skin, continue_ear_skin
 
-        color, ear_skin_texels = continue_ear_skin(
-            texel,
-            color,
-            best,
-            parts,
-            tn,
-            vertices=p,
-            faces=f,
-            binding=surface_binding,
-            regions=ear_regions,
-        )
-        confidence = np.maximum(best, np.minimum(estimated_best, 1.0))
-        color, lower_skin_texels, lower_surface = continue_lower_skin(
-            texel,
-            color,
-            confidence,
-            p,
-            parts,
-            scalp,
-            f,
-            surface_binding,
-            source_confidence=best,
-            preserve=mouth | bottom,
-            pre_completion_color=color - skin_completion_delta,
-        )
+    color, ear_skin_texels = continue_ear_skin(
+        texel,
+        color,
+        best,
+        parts,
+        tn,
+        vertices=p,
+        faces=f,
+        binding=surface_binding,
+        regions=ear_regions,
+    )
+    confidence = np.maximum(best, np.minimum(estimated_best, 1.0))
+    color, lower_skin_texels, lower_surface = continue_lower_skin(
+        texel,
+        color,
+        confidence,
+        p,
+        parts,
+        scalp,
+        f,
+        surface_binding,
+        source_confidence=best,
+        preserve=mouth | bottom,
+        pre_completion_color=color - skin_completion_delta,
+    )
     eye_texels = 0
     socket_shading = None
     if eyes:
@@ -1433,7 +1421,7 @@ def bake_photographs(
             color=color,
             confidence=best,
             hairSupport=hair_support,
-            scalp=scalp if head_capture else np.zeros(len(texel)),
+            scalp=scalp,
             estimated=estimated_best,
             earOccluded=ear_hidden_total,
             total=total,
@@ -1493,19 +1481,16 @@ def bake_photographs(
             'textureSize': size,
             'sourceViews': len(selected),
             'lowConfidenceFraction': low,
-            'hairTextureFromPhotos': head_capture,
-            'shortHairCompletion': short_hair_audit if head_capture else None,
+            'fullHead': True,
+            'hairTextureFromPhotos': True,
+            'shortHairCompletion': short_hair_audit,
             'rearAppearance': (
                 'Captured rear photographs with inferred gaps'
                 if any(abs(yaw(im)) > 115 for im in train)
                 else (
                     'AI-predicted rear reference'
                     if rear_path.exists()
-                    else (
-                        'Photographic material continuation'
-                        if head_capture
-                        else 'Unobserved gray'
-                    )
+                    else 'Photographic material continuation'
                 )
             ),
             'photographedCapFraction': float(np.mean(best[~observed] > 0.001)),

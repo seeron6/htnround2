@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as THREE from 'three';
 import { HeadHair, remapHairRoots } from '../src/head-hair.js';
+import { HeadHairSurface } from '../src/head-hair-surface.js';
 
 function fixture(type = 'wavy') {
   const g = new THREE.BufferGeometry();
@@ -34,6 +35,40 @@ function fixture(type = 'wavy') {
   };
   return { g, spec };
 }
+
+test('surface-bound hair shell stays separate and finite on the captured scalp', () => {
+  const g = new THREE.BufferGeometry(),
+    positions = [],
+    rows = 8,
+    cols = 8;
+  for (let y = 0; y <= rows; y++)
+    for (let x = 0; x <= cols; x++)
+      positions.push(
+        (x / cols - 0.5) * 0.18,
+        0.13 + 0.004 * Math.cos((x / cols) * Math.PI),
+        -0.18 + (y / rows) * 0.12,
+      );
+  const indices = [];
+  for (let y = 0; y < rows; y++)
+    for (let x = 0; x < cols; x++) {
+      const a = y * (cols + 1) + x,
+        b = a + 1,
+        c = a + cols + 1,
+        d = c + 1;
+      indices.push(a, c, b, b, c, d);
+    }
+  g.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  g.setIndex(indices);
+  g.computeVertexNormals();
+  const before = g.attributes.position.array.slice(),
+    shell = new HeadHairSurface(g, { hairlineY: 0.1 });
+  assert.equal(shell.userData.structure, 'surface-shell');
+  assert.ok(shell.geometry.attributes.position.array.every(Number.isFinite));
+  assert.deepEqual(g.attributes.position.array, before);
+  assert.ok(shell.geometry.index.count > 32);
+  shell.dispose();
+  g.dispose();
+});
 
 test('hair types change finite 3D geometry and saved controls reproduce it exactly', () => {
   const shapes = [];

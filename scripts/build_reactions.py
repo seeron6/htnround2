@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Pre-generate cached reaction audio via ElevenLabs.
 
-Reads `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` from env or `.env`, then
+Reads `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` from env, `.env` or
+`.local/secrets/elevenlabs.json` (what the panel's "ElevenLabs key" box writes), then
 POSTs each short prompt in REACTIONS and writes a WAV under
 `public/omni-reactions/<key>.wav`. Falls back to no-op if the key is absent
 (the runtime synth in `src/omni/reactions.js` covers that case).
@@ -63,8 +64,22 @@ def wav(pcm: bytes, rate: int) -> bytes:
 
 def main() -> int:
     env = load_env(ROOT / '.env')
-    api_key = os.environ.get('ELEVENLABS_API_KEY') or env.get('ELEVENLABS_API_KEY')
-    voice_id = os.environ.get('ELEVENLABS_VOICE_ID') or env.get('ELEVENLABS_VOICE_ID')
+    try:
+        saved = json.loads((ROOT / '.local/secrets/elevenlabs.json').read_text())
+    except (OSError, ValueError):
+        saved = {}
+    api_key = (
+        os.environ.get('ELEVENLABS_API_KEY')
+        or env.get('ELEVENLABS_API_KEY')
+        or saved.get('apiKey')
+    )
+    # No voice chosen: the face's default backup voice (elevenlabs_voice.DEFAULTS['face']).
+    voice_id = (
+        os.environ.get('ELEVENLABS_VOICE_ID')
+        or env.get('ELEVENLABS_VOICE_ID')
+        or saved.get('voiceId')
+        or 'N2lVS1w4EtoT3dr4eOWO'
+    )
     if not api_key or not voice_id:
         print(
             'ELEVENLABS_API_KEY / ELEVENLABS_VOICE_ID unset — nothing to generate.',

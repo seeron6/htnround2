@@ -1,5 +1,10 @@
 # Facial reaction after a punch
 
+> **Superseded 2026-09-20 by [PAIN_RIG.md](PAIN_RIG.md):** the single wince below became a
+> control rig with three poses (flinch, grimace, ache), a head flinch and a gasp, and
+> `src/pain-expression.js` now only re-exports it. The timings and test counts in this file
+> describe the earlier version.
+
 The earlier NFR-inspired change limited local stretching but did not add the expressive
 response the user wanted. `src/pain-expression.js` now supplies a separate, visible
 wince to topology-backed live heads through `FaceImpactRig` in `src/impact-rig.js`.

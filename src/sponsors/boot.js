@@ -4,6 +4,7 @@
 import './sponsors.css';
 import { RoundStats } from './telemetry.js';
 import { obs, initSentry, reportPhysics } from './sentry.js';
+import { startFlightRecorder, afterSentryStarts } from './flight-recorder.js';
 import { createCornerman } from './cornerman.js';
 import { createArenaHost } from './arena-host.js';
 // The shared-engine Arena is a NO-OP unless the `arena_omni` flag is set.
@@ -11,6 +12,8 @@ import { createArenaHost } from './arena-host.js';
 import { enableArenaOmniIfFlagged } from '../scenarios/arena/engine-wire.js';
 
 const API = 'http://127.0.0.1:5176';
+// Before anything else, and before the DSN is known: see flight-recorder.js.
+startFlightRecorder();
 let config = null,
   seen = 0,
   demoFace = null,
@@ -91,6 +94,7 @@ async function start() {
       await initSentry(config.sentry);
       reportPhysics(() => window.__punchingFace?.state);
       obs.tag('app', 'punching-face-host');
+      afterSentryStarts(dock);
     } catch (error) {
       console.warn('Sentry did not start:', error);
     }
@@ -115,6 +119,15 @@ async function start() {
   // One place records a landed punch, whoever threw it: stats first, then the face and the room hear about it.
   const record = (contact, who) => {
     seen = contact.time;
+    // Contact -> here. The face's grunt can start no sooner than this, so it is that claim's floor.
+    obs.metric(
+      'punch.dispatch_delay',
+      performance.now() - contact.time,
+      'millisecond',
+      {
+        source: contact.source,
+      },
+    );
     const triggers = stats.add({
       id: who.id,
       name: who.name,

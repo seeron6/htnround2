@@ -2,6 +2,18 @@
 // Concurrent library/job lookups share one read burst; later calls get fresh state.
 let inFlight = null;
 
+export async function renameHead(id, name) {
+  const result = await readJson('face-rename', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id, name }),
+  });
+  // An older poll may still be in flight when a rename finishes.
+  inFlight = null;
+  window.dispatchEvent(new CustomEvent('punching-face-library-changed'));
+  return result;
+}
+
 async function readJson(path, options = {}) {
   const response = await fetch(`/api/${path}`, { cache: 'no-store', ...options });
   if (!response.ok) {
@@ -64,7 +76,9 @@ function describe(capture, engine, job = null) {
 export async function listSavedHeads() {
   const snapshot = await readSnapshot();
   return snapshot.flatMap(({ capture, meshy }) => [
-    ...(capture.photoModel ? [describe(capture, 'local')] : []),
+    ...(capture.photoModel && capture.evidence?.includesHairCapture !== false
+      ? [describe(capture, 'local')]
+      : []),
     ...(meshy?.model ? [describe(capture, 'meshy', meshy)] : []),
   ]);
 }

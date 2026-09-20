@@ -1,5 +1,6 @@
 import { FaceImpactRig } from './impact-rig.js';
 import { impactCacheKey, restContact } from './impact-cache.js';
+import { wouldFracture } from './bone-fracture.js';
 
 let rig = null;
 function emit(payload) {
@@ -38,6 +39,15 @@ self.onmessage = ({ data }) => {
         const direct = rig.tissue.vertices[rig.tissue.nearest(point).node].p;
         for (const location of [direct, restContact(rig.tissue, point, direction)])
           for (const magnitude of [0.85, 0.9]) {
+            // A blow that breaks bone is prepared in order on the main thread
+            // and is never asked of this cache: do not spend the warm-up on it.
+            if (
+              wouldFracture(
+                rig.tissue.materials[rig.tissue.nearest(location).node],
+                magnitude,
+              )
+            )
+              continue;
             const input = { location, direction, magnitude };
             const key = impactCacheKey(input, 0.75, true);
             if (keys.has(key)) continue;

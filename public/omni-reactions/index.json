@@ -1,0 +1,96 @@
+{
+ "Dylan": {
+  "high": [
+   "high.1.wav",
+   "high.2.wav",
+   "high.3.wav"
+  ],
+  "low": [
+   "low.1.wav",
+   "low.2.wav"
+  ],
+  "mid": [
+   "mid.1.wav",
+   "mid.2.wav",
+   "mid.3.wav"
+  ]
+ },
+ "Ethan": {
+  "high": [
+   "high.1.wav",
+   "high.2.wav",
+   "high.3.wav"
+  ],
+  "low": [
+   "low.1.wav",
+   "low.2.wav"
+  ],
+  "mid": [
+   "mid.1.wav",
+   "mid.2.wav",
+   "mid.3.wav"
+  ]
+ },
+ "Jennifer": {
+  "high": [
+   "high.1.wav",
+   "high.2.wav",
+   "high.3.wav"
+  ],
+  "low": [
+   "low.1.wav",
+   "low.2.wav",
+   "low.3.wav"
+  ],
+  "mid": [
+   "mid.1.wav",
+   "mid.2.wav",
+   "mid.3.wav"
+  ]
+ },
+ "Katerina": {
+  "high": [
+   "high.1.wav",
+   "high.2.wav"
+  ],
+  "low": [
+   "low.1.wav",
+   "low.2.wav",
+   "low.3.wav"
+  ],
+  "mid": [
+   "mid.1.wav",
+   "mid.2.wav",
+   "mid.3.wav"
+  ]
+ },
+ "Marcus": {
+  "high": [
+   "high.1.wav"
+  ],
+  "low": [
+   "low.1.wav",
+   "low.2.wav",
+   "low.3.wav"
+  ],
+  "mid": [
+   "mid.1.wav",
+   "mid.2.wav",
+   "mid.3.wav"
+  ]
+ },
+ "Ryan": {
+  "high": [
+   "high.1.wav",
+   "high.2.wav"
+  ],
+  "low": [
+   "low.1.wav"
+  ],
+  "mid": [
+   "mid.1.wav",
+   "mid.2.wav",
+   "mid.3.wav"
+  ]
+ }
+}

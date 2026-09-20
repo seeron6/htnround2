@@ -58,6 +58,7 @@ FACE_STORE = FaceStore(
 MESHY = meshy_backend.MeshyEngine(FACE_STORE)
 FACE_ROUTES = {
     '/api/face-captures',
+    '/api/face-rename',
     '/api/face-frames',
     '/api/face-train',
     '/api/face-status',
