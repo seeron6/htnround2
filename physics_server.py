@@ -173,6 +173,16 @@ def dispatch(path, data):
                 contacts=result.get('contacts'),
                 peak_mm=round(result.get('peakMm', 0), 2),
             )
+        # Only with CONTACT_PHYSICS_SLEEP=1 (newton_face.py). One log per change of state, so the
+        # share of a session spent asleep can be read off in Sentry.
+        asleep = bool(result.get('asleep'))
+        if sponsor_obs and asleep != item.get('asleep', False):
+            sponsor_obs.log(
+                'physics.asleep' if asleep else 'physics.awake',
+                simulated_s=round(result.get('simulationTime', 0), 2),
+                contacts=result.get('contacts'),
+            )
+        item['asleep'] = asleep
         return result
 
 
@@ -205,7 +215,11 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, KeyError, TypeError, OSError) as e:
             result = {'error': str(e)}
             code = 400
-        except Exception:
+        except Exception as crash:
+            # The page only ever sees the sentence below. Without this line a solver blow-up (a
+            # NaN impact once took a session down) left no trace anywhere but this terminal.
+            if sponsor_obs:
+                sponsor_obs.capture(crash, {'endpoint': self.path.split('?')[0]})
             result = {
                 'error': 'Newton could not advance the simulation. Reload the model.'
             }

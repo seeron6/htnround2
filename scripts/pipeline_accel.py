@@ -489,8 +489,9 @@ def install_prefetch(build, log=print):
     hair_recognition, head_semantics and eye_detail need only the list of views
     that astra_head_completion chose, never its answer. Each is started as soon
     as that list exists and writes its usual cache file; the serial call that
-    follows in build.run() reads it. Any prefetch failure is ignored, leaving
-    that serial call to run, and raise, exactly as before.
+    follows in build.run() reads it. Failures propagate: the HTTP client has
+    already handled bounded recovery. Repeating a timed-out fanout inline can
+    double the wait; an explicit retry reuses validated per-request caches.
     """
     if os.environ.get('CONTACT_PREFETCH') == '0':
         return False
@@ -510,11 +511,8 @@ def install_prefetch(build, log=print):
         task = tasks.get(name)
         if task:
             task.done.wait()
-            if task.error and log:
-                log(
-                    f'pipeline_accel: {name} prefetch failed ({task.error}); running it inline.',
-                    flush=True,
-                )
+            if task.error:
+                raise task.error
 
     def planned(completion):
         # The cache keys hash the views in order. A model may return them in

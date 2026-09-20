@@ -1,0 +1,29 @@
+# Arm modes and quick scan
+
+The calibration screen and Camera panel share three display options:
+
+1. **Skeleton arms (original)** uses the existing purple hand/forearm skeleton.
+2. **Live CV arms (Jace)** uses Jace's camera cutout with tighter arm-only selection. In the front view, a forearm stops at its visible matched elbow; if the elbow is missing, only the hand remains. Temporal dropout support cannot grow into the shirt. The separate first-person camera retains its corner anchoring. This is still monocular segmentation, so difficult overlaps can remain imperfect.
+3. **My 3D arms (quick scan / presets)** places a pair of bare or clothed arm meshes below the viewer's camera. Local arm templates are reused and posed locally. Tracking drives reach while the rendered hands stay in closed boxing fists; actual tracked finger closure still gates punch detection. The browser physics arm motor integrates recoil from the same landed-contact events used by the head/Newton path. Preset generation is local mesh fitting, not a Newton reconstruction or a new server simulation.
+
+## Scan during calibration
+
+Choose **Scan / customize my arms**. Once the camera/pose model is ready, **Scan my arms · 8 seconds** records matched RGB/hand/elbow samples from the same worker frame. Keep both forearms away from the shirt, with elbows and fingers visible, and slowly roll the wrists. At least three usable frames per arm are required. A failed, cancelled, hidden-tab or disconnected-camera scan keeps the previous arms.
+
+The fit combines colors and sleeve coverage across matched frames, preferring exposed forearm skin over the lighter palm when available. It keeps 64x192 photograph strips of the forearm and, when the shoulder is visible, upper arm; short sleeves are detected there. These preserve visible garment colors, seams and markings. Skin outside the crop uses the measured color with neutral atlas detail, rather than the template person's skin hue. The worker preserves up to 1280px source width during scanning so small finger and fabric details are not unnecessarily discarded.
+
+Visible wrist and finger bands are estimated locally using bounded contrast regions, anatomical landmarks and repeated evidence (at least three frames). The result can add a watch on one wrist and a ring on the other hand, including band/face color, ring color and the detected finger. Rings are fitted outside the chosen finger's surface. Show open fingers, backs of hands and the watch face; occluded jewelry, very low contrast, tattoos resembling bands and insufficient finger resolution can still cause misses or false positives. This is an appearance fit on a generic mesh, not exact reconstruction of the arm, watch shape or fabric fibers. Hoodies remain a manual style choice. Hidden surfaces are approximated.
+
+Choose **Both arms**, **Left arm**, or **Right arm** for edits. Mixed watch/ring values show indeterminate checkboxes when both arms are selected. A successful scan updates the preview and replaces manual accessory flags with its per-arm detections; the persistent footer reports each arm's result. Failed scans show an explicit error and keep the previous draft. Clothing/color edits turn off photographed details to honor the override; the checkbox can restore them. **Use these arms** applies and saves the fitted profiles and small strips in this browser, including accessories and their colors. Existing 32x128 saved scans still load. Closing without using the arms discards draft edits. Existing multiview capture/import remains in the advanced section.
+
+## Timing and verification
+
+The target is less than 15 seconds from **Start scan** to a rendered pair of fitted arms. Camera permission and the initial pose-model warmup happen before Start is enabled; user review time is excluded. Capture lasts eight seconds. Fitting has no server, training, download or reconstruction dependency. Interrupted/over-budget attempts display a failure rather than reporting success.
+
+Browser measurement on this Mac, 2026-09-20: **8.094 s total** (8.005 s capture + **0.089 s fitting/rendering**, 53 accepted views per arm), using synthetic RGB + joint fixtures through the production capture accumulator, UI, texture fitter and renderer. This is not a measured real-webcam or cold-model run. Live subject quality still needs testing under the user's camera and lighting. Timings and accepted frame counts are exposed in the existing lab state as `quickArms`.
+
+Expanded appearance fit, 2026-09-20: **8.623 s total** (8.075 s capture + 0.548 s fitting/rendering, 54 views per arm). The asymmetric fixture visibly retained its skin colors, cream/navy sleeves, left watch and right middle-finger ring; save and reload preserved the profiles. This run used `?appearance=1&still=1`, which pauses continuous preview animation for inspection on a busy machine. It does not measure real-webcam recognition or continuous rendering performance. The controller, sampling, worker, geometry, pose and mask checks pass **36 tests**.
+
+Validation: `node --test tests/arm-personalization.test.mjs tests/arm-scan-worker.test.mjs tests/anatomical-arm.test.mjs tests/arm-mask.test.mjs tests/arm-pose.test.mjs`. The browser fixture at `/tests/arm-scan-browser.html?appearance=1` has two different skin tones, patterned cream long sleeves and a watch on the left, navy short sleeves and a middle-finger ring on the right. It uses generated pixels, requires no camera permission, and supports scan, cancel, preview and recoil checks. Run it on a separate Vite port so its saved synthetic preset does not replace a personal browser preset. Synthetic success does not establish accuracy on the user's real webcam.
+
+No new packages, model downloads, Python environment changes, or reconstruction-server instances are required.

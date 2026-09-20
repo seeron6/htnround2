@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { impactParameters, DEFAULT_IMPACT_MAGNITUDE } from './tissue-field.js';
+import { FRACTURE_LABELS } from './bone-fracture.js';
 
 // UI and CV boundary are separate from the capture / sponsor entry points.
 export function installImpactControls({
@@ -23,7 +24,8 @@ export function installImpactControls({
       <option value="clay">Clay head · permanent dents</option>
     </select>
     <p id="head-mode-note" class="muted">
-      Recovers after impact. Above 0.90, bone regions retain damage until Reset head.
+      Reacts, then recovers. At 0.70 or more, a hit on bone leaves a slight break until
+      Reset head.
     </p>
     <label class="controls-label" for="impact-strength"
       >Impact magnitude
@@ -114,7 +116,7 @@ export function installImpactControls({
     $('head-mode-note').textContent =
       mode === 'clay'
         ? 'Dents accumulate and stay until Reset head.'
-        : 'Recovers after impact. Above 0.90, bone regions retain damage until Reset head.';
+        : 'Reacts, then recovers. At 0.70 or more, a hit on bone leaves a slight break until Reset head.';
     release();
     window.dispatchEvent(
       new CustomEvent('punching-face-mode-change', { detail: { mode } }),
@@ -151,9 +153,12 @@ export function installImpactControls({
       'directional',
       { magnitude: p.magnitude },
     );
-    if (landed)
+    if (landed) {
+      // A blow that breaks bone is prepared in order, so its report is already in.
+      const broken = d.headMode === 'live' && d.impactRig.lastImpact?.fracture;
       $('impact-state').textContent =
-        `${d.headMode === 'clay' ? 'Clay impression' : p.magnitude > 0.9 ? 'Live impact · damage enabled' : 'Live impact'} · magnitude ${p.magnitude.toFixed(2)}`;
+        `${d.headMode === 'clay' ? 'Clay impression' : broken ? `Live impact · broken ${FRACTURE_LABELS[broken.bone]}` : 'Live impact'} · magnitude ${p.magnitude.toFixed(2)}`;
+    }
     return landed;
   }
   function angledDirection(normal) {

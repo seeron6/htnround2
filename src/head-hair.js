@@ -1,5 +1,9 @@
 import * as THREE from 'three';
-import { photoStrandGeometry, validatePhotoCurves } from './photo-hair-strands.js';
+import {
+  photoStrandGeometry,
+  posteriorCompletionGeometry,
+  validatePhotoCurves,
+} from './photo-hair-strands.js';
 
 const clamp = THREE.MathUtils.clamp;
 const types = ['straight', 'wavy', 'curly', 'coily', 'braided', 'locs'];
@@ -10,6 +14,30 @@ function randomGenerator(seed) {
     s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
     return s / 4294967296;
   };
+}
+
+function appendHairGeometry(base, extra) {
+  if (!extra) return { geometry: base, offset: 0 };
+  const names = ['position', 'normal', 'color', 'uv'],
+    offset = base.attributes.position.count,
+    geometry = new THREE.BufferGeometry();
+  for (const name of names) {
+    const a = base.attributes[name],
+      b = extra.attributes[name];
+    if (!a || !b) continue;
+    const values = new Float32Array(a.array.length + b.array.length);
+    values.set(a.array);
+    values.set(b.array, a.array.length);
+    geometry.setAttribute(name, new THREE.BufferAttribute(values, a.itemSize));
+  }
+  const ai = base.index?.array ?? [],
+    bi = extra.index?.array ?? [],
+    indices = new Uint32Array(ai.length + bi.length);
+  indices.set(ai);
+  for (let i = 0; i < bi.length; i++) indices[ai.length + i] = bi[i] + offset;
+  geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+  geometry.computeBoundingSphere();
+  return { geometry, offset };
 }
 
 // Independent tapered fibers. Roots follow the welded surface, so UV seams,
@@ -90,10 +118,18 @@ export class HeadHair extends THREE.Mesh {
             side: THREE.DoubleSide,
           });
       const result = photoStrandGeometry(source, this.spec, p);
+      const posterior = posteriorCompletionGeometry(source, this.spec, p),
+        merged = appendHairGeometry(result.geometry, posterior.geometry);
       this.geometry.dispose();
-      this.geometry = result.geometry;
+      this.geometry = merged.geometry;
       this.roots = result.roots;
-      this.strandCount = result.strandCount;
+      this.posteriorRoots = posterior.bindings.map((binding) => ({
+        ...binding,
+        start: binding.start + merged.offset,
+      }));
+      this.posteriorLast = new Float32Array(this.posteriorRoots.length * 6);
+      this.posteriorLast.fill(Infinity);
+      this.strandCount = result.strandCount + posterior.strandCount;
       this.base = this.geometry.attributes.position.array.slice();
       this.baseNormals = this.geometry.attributes.normal.array.slice();
       this.bindCurveStations(source);
@@ -101,6 +137,8 @@ export class HeadHair extends THREE.Mesh {
       this.lastRoots.fill(Infinity);
       return;
     }
+    this.posteriorRoots = [];
+    this.posteriorLast = new Float32Array();
     if (guides && !this.material.isMeshBasicMaterial) {
       this.material.dispose();
       this.material = new THREE.MeshBasicMaterial({
@@ -377,6 +415,7 @@ export class HeadHair extends THREE.Mesh {
       this.geometry.attributes.position.needsUpdate = true;
       this.geometry.attributes.normal.needsUpdate = true;
     }
+    this.updatePosteriorSurface(source);
   }
 
   bindCurveStations(source) {
@@ -480,6 +519,57 @@ export class HeadHair extends THREE.Mesh {
             .applyQuaternion(q)
             .toArray(on, vertex);
         }
+      changed = true;
+    }
+    if (changed) {
+      this.geometry.attributes.position.needsUpdate = true;
+      this.geometry.attributes.normal.needsUpdate = true;
+    }
+    this.updatePosteriorSurface(source);
+  }
+
+  updatePosteriorSurface(source) {
+    if (!this.posteriorRoots?.length) return;
+    const p = source.attributes.position.array,
+      sn = source.attributes.normal.array,
+      out = this.geometry.attributes.position.array,
+      on = this.geometry.attributes.normal.array,
+      root = new THREE.Vector3(),
+      normal = new THREE.Vector3(),
+      point = new THREE.Vector3(),
+      q = new THREE.Quaternion();
+    let changed = false;
+    for (let i = 0; i < this.posteriorRoots.length; i++) {
+      const bind = this.posteriorRoots[i];
+      root.set(0, 0, 0);
+      normal.set(0, 0, 0);
+      for (let k = 0; k < 3; k++) {
+        const id = bind.ids[k] * 3,
+          weight = bind.weights[k];
+        point.fromArray(p, id);
+        root.addScaledVector(point, weight);
+        point.fromArray(sn, id);
+        normal.addScaledVector(point, weight);
+      }
+      normal.normalize();
+      const at = i * 6,
+        values = [root.x, root.y, root.z, normal.x, normal.y, normal.z];
+      if (values.every((v, k) => Math.abs(v - this.posteriorLast[at + k]) < 1e-6))
+        continue;
+      this.posteriorLast.set(values, at);
+      q.setFromUnitVectors(bind.normal, normal);
+      for (let j = bind.start; j < bind.start + bind.count; j++) {
+        point
+          .fromArray(this.base, j * 3)
+          .sub(bind.root)
+          .applyQuaternion(q)
+          .add(root)
+          .toArray(out, j * 3);
+        point
+          .fromArray(this.baseNormals, j * 3)
+          .applyQuaternion(q)
+          .toArray(on, j * 3);
+      }
       changed = true;
     }
     if (changed) {

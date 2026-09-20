@@ -36,7 +36,8 @@ test('real reconstructed surface compresses, stays bounded, and returns to rest'
   const d = fixture();
   const index = Array.from(d.rest).findIndex((v, i) => i % 3 === 2 && v > 0.08);
   const point = new THREE.Vector3(...d.rest.slice(index - 2, index + 1));
-  assert.ok(d.impulse(point, new THREE.Vector3(0.6, 0, -0.8), 2) > 50);
+  // Below 0.70 nothing breaks (src/bone-fracture.js), so all of it comes back.
+  assert.ok(d.impulse(point, new THREE.Vector3(0.6, 0, -0.8), 0.9) > 50);
   let peak = 0;
   for (let frame = 0; frame < 360; frame++) {
     d.step(1 / 120);

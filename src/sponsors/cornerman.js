@@ -3,6 +3,16 @@
 // `face` — the head you are punching, talking back, which is the default; `coach` — a cornerman
 // calling corrections. Only the system prompt and the labels change; the transport is identical.
 //
+// Who speaks: OMNI's own voice first, picked here from the ones the gateway accepts. ElevenLabs is
+// the backup (no OMNI key, a refused voice, words without audio) and can be put in front on
+// purpose. Both arrive as the same `audio` events, so the mouth and the echo gate do not care. Only
+// when neither spoke does the browser's speechSynthesis read the line, so the face is never mute.
+//
+// What OMNI gets each turn (see omni_senses.py): the keyframes as one short *video*, the person's
+// voice, or on a punch-triggered turn the last seconds of room sound, and the punch numbers. What
+// comes back is speech plus, from a parallel function call, the expression the head should wear
+// (`expression` event -> ./expression.js -> the same mouth channel the voice drives).
+//
 // Perception stays on this device at 30 Hz; only a spoken question, up to four small keyframes and a
 // few numbers leave it, once per turn, and only while the panel is switched on. The key never reaches
 // this page: the loopback relay holds it.
@@ -18,17 +28,26 @@ import {
 import { EventStream } from './sse.js';
 import { obs } from './sentry.js';
 import { createMouthSignal, createSyntheticSignal } from '../omni/mouth-signal.js';
+import { createExpressionSignal, blendMouth, EXPRESSION_ICONS } from './expression.js';
+import { createGrunts, gruntLevel } from './grunts.js';
+import { createInstantExpression, verdict } from './instant-expression.js';
 
 const TAP =
   "class Tap extends AudioWorkletProcessor{process(i){const c=i[0][0];if(c)this.port.postMessage(c.slice(0));return true}}registerProcessor('punching-face-tap',Tap)";
 const FRAME_MS = 20,
   PREROLL_FRAMES = 15,
-  KEYFRAME_MS = 700,
-  KEYFRAMES = 4,
+  KEYFRAME_MS = 500,
+  KEYFRAMES = 6,
+  ROOM_SECONDS = 2.5,
+  GRUNT_GAP_MS = 350,
   QUIET_AFTER_TURN_MS = 7000,
   PUNCHES_PER_CUE = 8;
 const MODE_KEY = 'punching-face-sponsors-mode';
 const INTERACTION_KEY = 'punching-face-sponsors-voice-interaction';
+// Voice picks are kept per mode: choosing a coach must not change what the face sounds like.
+const OMNI_VOICE_KEY = 'punching-face-sponsors-omni-voice-',
+  BACKUP_VOICE_KEY = 'punching-face-sponsors-backup-voice-',
+  PREFER_BACKUP_KEY = 'punching-face-sponsors-prefer-backup';
 const MODES = {
   face: {
     label: 'Face',
@@ -59,19 +78,34 @@ const MODES = {
 export function createCornerman({ api, panel, config, stats, refreshConfig, onMode }) {
   panel.innerHTML = `
     <div class="sd-row" style="margin-top:0"><select data-k="mode" aria-label="Who is talking"><option value="face">Trash talk — the face</option><option value="coach">Coach — a cornerman</option></select></div>
-    <div class="sd-row"><button class="primary" data-k="toggle" style="flex:1">Wake the face</button><span class="sd-badge" data-k="model"></span></div>
+    <div class="sd-row"><button class="primary" data-k="toggle" style="flex:1">Wake the face</button><span class="sd-badge" data-k="model"></span><span class="sd-badge" data-k="mood" title="Set by the OMNI model through a set_expression tool call" hidden></span></div>
     <div class="sd-meter" data-k="meter"><i></i></div>
     <div class="sd-status" data-k="status">Ready.</div>
     <div class="sd-log" data-k="log" aria-live="polite"></div>
     <div class="sd-row"><input type="text" data-k="ask" maxlength="300"><button data-k="send">Ask</button></div>
     <label class="sd-check"><input type="checkbox" data-k="vision" checked><span data-k="seelabel">Let it see me </span><span class="sd-badge leaving" data-k="leaving"></span></label>
+    <label class="sd-check"><input type="checkbox" data-k="hearroom" checked><span>Let it hear the room when I punch</span></label>
+    <label class="sd-check"><input type="checkbox" data-k="grunt" checked><span>Grunt the instant it is hit <span class="sd-badge" title="Recorded once in its own OMNI voice, played from memory: no network in the way">cached · &lt;50 ms</span></span></label>
+    <label class="sd-check"><input type="checkbox" data-k="instant" checked><span>React on its face the instant it is hit <span class="sd-badge" title="Chosen on this device from the measured punch, the moment it lands. OMNI's set_expression call confirms or corrects it a second or two later. Untick to wait for OMNI, as before.">on device · OMNI corrects</span></span></label>
     <label class="sd-check"><input type="checkbox" data-k="voice" checked><span>Spoken replies</span></label>
+    <div data-k="voicebox" hidden>
+    <label class="sd-status" for="cornerman-omnivoice">Voice · OMNI</label>
+    <div class="sd-row"><select id="cornerman-omnivoice" data-k="omnivoice"></select><button data-k="hearomni">Hear it</button></div>
+    <label class="sd-status" for="cornerman-backupvoice">Backup voice · ElevenLabs</label>
+    <div class="sd-row"><select id="cornerman-backupvoice" data-k="backupvoice"></select><button data-k="hearbackup">Hear it</button></div>
+    <label class="sd-check"><input type="checkbox" data-k="preferbackup"><span>Use the ElevenLabs voice instead of OMNI's</span></label>
+    <div class="sd-status" data-k="voicenote"></div>
+    </div>
     <label class="sd-status" for="cornerman-interaction">Voice interaction</label>
     <div class="sd-row"><select id="cornerman-interaction" data-k="interaction"><option value="ambient">Ambient · finish replies</option><option value="interrupt">Interrupt · talk over replies</option></select></div>
     <label class="sd-check"><input type="checkbox" data-k="proactive" checked><span data-k="talklabel"></span></label>
     <details><summary>OMNI key</summary>
       <div class="sd-status">Stored only on this computer (<code>.local/secrets/omni.json</code>, mode 0600). Get one from the Huawei form; the gateway is <span data-k="gateway"></span>.</div>
       <div class="sd-row"><input type="password" data-k="key" placeholder="API key" autocomplete="off"><button data-k="save">Save</button></div>
+    </details>
+    <details><summary>ElevenLabs key (backup voice)</summary>
+      <div class="sd-status">Stored only on this computer (<code>.local/secrets/elevenlabs.json</code>, mode 0600). The key needs the <b>Text to Speech</b> permission; <b>Voices: Read</b> lets this panel check which voices the account has.</div>
+      <div class="sd-row"><input type="password" data-k="elevenkey" placeholder="ElevenLabs API key" autocomplete="off"><button data-k="elevensave">Save</button></div>
     </details>`;
   const el = Object.fromEntries(
     [...panel.querySelectorAll('[data-k]')].map((n) => [n.dataset.k, n]),
@@ -94,12 +128,28 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
     ambientReadyAt = 0,
     ignoringAudio = false,
     sinceTurn = 0,
-    keyTimer = null;
+    keyTimer = null,
+    voices = null,
+    hearing = false,
+    expression = null,
+    moodTimer = null,
+    gruntUntil = 0,
+    lastGruntAt = -Infinity;
+  const grunts = createGrunts(),
+    instant = createInstantExpression();
+  // What the device chose for the punch OMNI is now being asked about, until OMNI answers.
+  let guess = null;
+  let room = [],
+    roomSamples = 0;
   let pending = new Float32Array(0),
     preroll = [],
     recording = null,
     frames = [],
-    history = [];
+    // Whether #webcam is actually handing over pixels. The badge reports this rather than the
+    // checkbox: a ticked box over a camera nobody connected used to advertise a clip that never left.
+    seeing = false,
+    history = [],
+    dialogueTurn = 0;
   const playing = new Set(),
     spokenReplies = new Set(),
     grab = document.createElement('canvas');
@@ -145,9 +195,18 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
     el.gateway.textContent = omni.gateway;
     el.leaving.textContent = !enabled
       ? ''
-      : el.vision.checked
-        ? `≤${KEYFRAMES} keyframes + voice per turn → ${omni.gateway}`
-        : 'voice + numbers only';
+      : (el.vision.checked && !seeing
+          ? 'webcam not connected · it cannot see you — '
+          : '') +
+        [
+          el.vision.checked && seeing ? `${KEYFRAMES}-frame clip` : null,
+          'your voice',
+          el.hearroom.checked ? `${ROOM_SECONDS} s of room sound on a punch` : null,
+          'punch numbers',
+        ]
+          .filter(Boolean)
+          .join(' + ') +
+        ` → ${omni.gateway}`;
     el.toggle.textContent = enabled ? voice().stop : voice().start;
     el.toggle.classList.toggle('danger', enabled);
     el.toggle.classList.toggle('primary', !enabled);
@@ -156,6 +215,196 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
     el.talklabel.textContent = voice().talk;
     el.mode.value = mode;
     onMode?.(voice().tab);
+  }
+
+  const recall = (key) => {
+    try {
+      return localStorage.getItem(key);
+    } catch {
+      return null;
+    }
+  };
+  const keep = (key, value) => {
+    try {
+      localStorage.setItem(key, value);
+    } catch {
+      /* private mode */
+    }
+  };
+  const option = (value, text, title = '') => {
+    const o = document.createElement('option');
+    o.value = value;
+    o.textContent = text;
+    o.title = title;
+    return o;
+  };
+  const group = (label, options) => {
+    const g = document.createElement('optgroup');
+    g.label = label;
+    g.append(...options);
+    return g;
+  };
+  const choose = (select, wanted, fallback) => {
+    select.value = [...select.options].some((o) => o.value === wanted)
+      ? wanted
+      : fallback;
+  };
+
+  // Says, under the pickers, who will actually be heard and why.
+  function describeVoice() {
+    if (!voices) return;
+    const { omni, backup } = voices;
+    const picked = omni.voices.find((v) => v.id === el.omnivoice.value);
+    const front = el.preferbackup.checked && backup.configured && !backup.problem;
+    let note = front
+      ? 'ElevenLabs is speaking; OMNI only writes the lines.'
+      : omni.configured
+        ? picked?.note || `OMNI voice ${el.omnivoice.value}.`
+        : backup.configured && !backup.problem
+          ? 'No OMNI key, so the stand-in is talking, in the ElevenLabs voice.'
+          : 'No OMNI key, so the stand-in is talking, read aloud by the browser.';
+    if (backup.problem) note += ' Backup unavailable: ' + backup.problem.message;
+    else if (!backup.configured)
+      note +=
+        ' No ElevenLabs key saved: if the OMNI voice fails, the browser reads the line.';
+    el.voicenote.textContent = note;
+    el.voicenote.classList.toggle('error', !!backup.problem);
+  }
+
+  // Both casts come from the relay: it knows which voices the gateway accepts and what the
+  // ElevenLabs account holds. Picks are per mode, so the lists are refilled when the mode changes.
+  function fillVoices() {
+    if (!voices) return;
+    const { omni, backup } = voices;
+    const fits = (v) => v.modes.includes(mode);
+    el.omnivoice.replaceChildren(
+      group(
+        'The cast',
+        omni.voices
+          .filter(fits)
+          .map((v) => option(v.id, `${v.name} · ${v.id}`, v.note)),
+      ),
+      group(
+        'Also accepted',
+        [...omni.voices.filter((v) => !fits(v)).map((v) => v.id), ...omni.also].map(
+          (id) => option(id, id),
+        ),
+      ),
+    );
+    choose(el.omnivoice, recall(OMNI_VOICE_KEY + mode), omni.default);
+    const cast = (v) =>
+      option(
+        v.id,
+        `${v.name} · ${v.actor}` +
+          (v.available === false ? ' (not on this account)' : ''),
+        v.note,
+      );
+    el.backupvoice.replaceChildren(
+      option(backup.auto, 'Match the OMNI voice'),
+      group('The cast', backup.voices.filter(fits).map(cast)),
+      group('Other roles', backup.voices.filter((v) => !fits(v)).map(cast)),
+      ...(backup.account.length
+        ? [
+            group(
+              'On this account',
+              backup.account.map((v) => option(v.id, `${v.name} · ${v.category}`)),
+            ),
+          ]
+        : []),
+    );
+    choose(el.backupvoice, recall(BACKUP_VOICE_KEY + mode), backup.auto);
+    el.preferbackup.checked = recall(PREFER_BACKUP_KEY) === '1' && backup.configured;
+    el.omnivoice.disabled = el.hearomni.disabled = !omni.configured;
+    el.backupvoice.disabled =
+      el.hearbackup.disabled =
+      el.preferbackup.disabled =
+        !backup.configured;
+    el.voicebox.hidden = false;
+    describeVoice();
+  }
+
+  async function loadVoices() {
+    try {
+      const response = await fetch(api + '/sponsors/voice/options');
+      if (!response.ok) throw new Error('voice options ' + response.status);
+      voices = await response.json();
+      fillVoices();
+    } catch {
+      // A relay from before the pickers: leave them hidden rather than offer dead controls.
+      voices = null;
+      el.voicebox.hidden = true;
+    }
+  }
+
+  // One sample line in the chosen voice. With the face awake it goes through the same bus as a
+  // reply, so the mouth moves; asleep, a context borrowed for the length of the line.
+  async function hear(engine) {
+    if (hearing || busy || speaking()) return;
+    hearing = true;
+    const own = ctx ? null : new AudioContext();
+    let at = 0,
+      heard = false,
+      who = '',
+      trouble = null;
+    try {
+      await (ctx || own).resume();
+      status('Asking for a sample…');
+      const response = await fetch(api + '/sponsors/voice/preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          engine,
+          mode,
+          omniVoice: el.omnivoice.value,
+          backupVoice: el.backupvoice.value,
+        }),
+      });
+      if (!response.ok)
+        throw new Error(
+          (await response.json().catch(() => ({}))).error ||
+            'The relay refused the request. Restart it: npm run sponsors',
+        );
+      const reader = response.body.getReader(),
+        decoder = new TextDecoder(),
+        stream = new EventStream();
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        for (const { event, data } of stream.feed(
+          decoder.decode(value, { stream: true }),
+        )) {
+          if (event === 'meta') who = data.voiceName || '';
+          else if (event === 'voice' && data.error) trouble = data.error.message;
+          else if (event === 'error') trouble = data.message;
+          else if (event === 'audio') {
+            heard = true;
+            const samples = pcm16ToFloat32(base64ToBytes(data.pcm16)),
+              rate = data.rate || 24000;
+            if (ctx) play(samples, rate);
+            else {
+              const buffer = own.createBuffer(1, samples.length, rate);
+              buffer.copyToChannel(samples, 0);
+              const source = own.createBufferSource();
+              source.buffer = buffer;
+              source.connect(own.destination);
+              at = Math.max(own.currentTime + 0.04, at);
+              source.start(at);
+              at += buffer.duration;
+            }
+          }
+        }
+      }
+      if (trouble) status(trouble, true);
+      else status(heard ? `That was ${who}.` : 'No audio came back.', !heard);
+      // A sample that worked, or a failure just learned, changes what the pickers should say.
+      if (engine === 'elevenlabs') loadVoices();
+    } catch (error) {
+      status(error.message, true);
+    } finally {
+      hearing = false;
+      if (own)
+        setTimeout(() => own.close(), Math.max(0, at - own.currentTime) * 1000 + 300);
+    }
   }
 
   function stopSpeaking() {
@@ -196,9 +445,14 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
   }
 
   function keyframe() {
-    const video = document.getElementById('webcam');
-    if (!enabled || !el.vision.checked || !video?.videoWidth || video.readyState < 2)
-      return;
+    if (!enabled) return;
+    const video = document.getElementById('webcam'),
+      ready = !!video?.videoWidth && video.readyState >= 2;
+    if (ready !== seeing) {
+      seeing = ready;
+      paint();
+    }
+    if (!el.vision.checked || !ready) return;
     grab.width = 320;
     grab.height = Math.round((320 * video.videoHeight) / video.videoWidth);
     grab.getContext('2d').drawImage(video, 0, 0, grab.width, grab.height);
@@ -210,6 +464,7 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
     if (busy) return;
     busy = true;
     controller = new AbortController();
+    const signal = controller.signal;
     sinceTurn = 0;
     lastTurnAt = performance.now();
     const sent = el.vision.checked ? frames.slice() : [];
@@ -217,14 +472,28 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
       mode,
       frames: sent,
       telemetry: stats.snapshot(performance.now(), trigger),
-      history: history.slice(-6),
+      history: history.slice(-12), // six exchanges, matching sponsor_dialogue.HISTORY_MESSAGES
+      dialogueTurn: dialogueTurn++,
       voice: el.voice.checked,
+      ...(voices && {
+        omniVoice: el.omnivoice.value,
+        backupVoice: el.backupvoice.value,
+        voiceEngine: el.preferbackup.checked ? 'elevenlabs' : 'omni',
+      }),
     };
     if (audio)
       body.audioWav = bytesToBase64(
         encodeWav(downsample(audio, ctx.sampleRate, 16000), 16000),
       );
     else if (text) body.text = text;
+    else {
+      // Nobody asked anything, a punch set this off: let it hear the exchange it is about to mock.
+      const heard = roomSound();
+      if (heard)
+        body.roomWav = bytesToBase64(
+          encodeWav(downsample(heard, ctx.sampleRate, 16000), 16000),
+        );
+    }
     if (text) say('you', text);
     else if (audio) say('you', '(spoke)');
     const line = say('coach', '…');
@@ -232,9 +501,18 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
       mock = false,
       started = performance.now(),
       firstAt = null,
-      served = null;
+      firstAudioAt = null,
+      voiceEngine = 'unknown',
+      served = null,
+      skippedRepeat = false,
+      heard = false,
+      speaker = null,
+      trouble = null;
     try {
-      await obs.span(
+      // A trace of its own per turn: this span -> the relay -> the agent run (reply, expression
+      // tool call, voice). `within` makes the request its child without leaving the span active
+      // while the reply streams, or the 30 Hz physics calls would all be adopted by it.
+      await obs.flow(
         'coach.turn',
         {
           'coach.mode': mode,
@@ -244,13 +522,15 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
             ? Math.round((audio.length / ctx.sampleRate) * 1000)
             : 0,
         },
-        async (span) => {
-          const response = await fetch(api + '/sponsors/coach/turn', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-            signal: controller.signal,
-          });
+        async (span, within) => {
+          const response = await within(() =>
+            fetch(api + '/sponsors/coach/turn', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(body),
+              signal,
+            }),
+          );
           if (!response.ok)
             throw new Error(
               (await response.json().catch(() => ({}))).error ||
@@ -261,6 +541,7 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
             stream = new EventStream();
           for (;;) {
             const { value, done } = await reader.read();
+            signal.throwIfAborted();
             if (done) break;
             for (const { event, data } of stream.feed(
               decoder.decode(value, { stream: true }),
@@ -273,6 +554,27 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
                 // serving its old system prompt no matter what this page sends.
                 served = data.mode ?? null;
                 span.setAttribute('coach.mode_served', served || 'unknown');
+                if (data.voiceEngine === 'omni' || data.voiceEngine === 'elevenlabs')
+                  speaker =
+                    (data.voiceEngine === 'omni' ? 'OMNI ' : 'ElevenLabs ') +
+                    (data.voiceName || '');
+                trouble = data.voiceProblem?.message || null;
+                voiceEngine = data.voiceEngine || 'unknown';
+                span.setAttribute('coach.voice_engine', voiceEngine);
+              } else if (event === 'expression') {
+                wear(data.emotion, data.intensity);
+                span.setAttribute('coach.expression', data.emotion);
+                span.setAttribute('coach.expression_ms', data.ms);
+              } else if (event === 'voice') {
+                // The backup stepped in for OMNI, or the backup itself failed.
+                if (data.error) trouble = data.error.message;
+                else if (data.fallback) {
+                  speaker =
+                    data.engine === 'elevenlabs'
+                      ? `ElevenLabs ${data.voiceName || ''} (backup: ${data.reason})`
+                      : null;
+                  span.setAttribute('coach.voice_fallback', data.engine);
+                }
               } else if (event === 'text') {
                 firstAt ??= performance.now();
                 said += data.delta;
@@ -280,8 +582,14 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
                 el.log.scrollTop = el.log.scrollHeight;
               } else if (event === 'audio') {
                 firstAt ??= performance.now();
-                if (el.voice.checked && ctx)
+                firstAudioAt ??= performance.now();
+                if (el.voice.checked && ctx) {
+                  heard = true;
                   play(pcm16ToFloat32(base64ToBytes(data.pcm16)), data.rate || 24000);
+                }
+              } else if (event === 'done') {
+                skippedRepeat = !!data.skippedRepeat;
+                span.setAttribute('coach.skipped_repeat', skippedRepeat);
               } else if (event === 'error')
                 throw new Error(
                   data.message +
@@ -293,13 +601,33 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
             'coach.first_response_ms',
             Math.round((firstAt ?? performance.now()) - started),
           );
+          // As the person at the table hears it: network, relay and gateway included. The relay
+          // records the model's own share of this as coach.first_token.
+          const about = { mode, engine: voiceEngine, mock, punch: !audio && !text };
+          if (firstAt)
+            obs.metric('face.first_response', firstAt - started, 'millisecond', about);
+          if (firstAudioAt) {
+            span.setAttribute(
+              'coach.first_audio_ms',
+              Math.round(firstAudioAt - started),
+            );
+            obs.metric(
+              'face.first_audio',
+              firstAudioAt - started,
+              'millisecond',
+              about,
+            );
+          }
         },
       );
-      if (!said)
+      signal.throwIfAborted();
+      if (!said && skippedRepeat) line.remove();
+      else if (!said)
         line.textContent =
           voice().speaker + (mode === 'coach' ? '(no reply)' : '(nothing)');
-      // The stand-in has no voice of its own; the browser reads it aloud so the loop can be rehearsed. It is labelled.
-      if (mock && said && el.voice.checked && 'speechSynthesis' in window) {
+      // Nobody spoke: the stand-in without a backup key, or OMNI and ElevenLabs both failing. The
+      // browser reads the line aloud so the face is never mute. The status line says so.
+      if (!heard && said && el.voice.checked && 'speechSynthesis' in window) {
         const utterance = new SpeechSynthesisUtterance(said);
         spokenReplies.add(utterance);
         if (gate) gate.ratio = 8;
@@ -332,6 +660,7 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
           },
           { role: 'assistant', content: said },
         );
+      history = history.slice(-12);
       if (served !== null && served !== mode)
         status(
           `The relay answered as "${served}", not "${mode}". Restart it: npm run sponsors`,
@@ -345,7 +674,16 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
       else
         status(
           (mock ? 'Mock reply (add an OMNI key for the real model). ' : '') +
-            (firstAt ? `First response in ${Math.round(firstAt - started)} ms.` : ''),
+            (skippedRepeat
+              ? 'Listening.'
+              : firstAt
+                ? `First response in ${Math.round(firstAt - started)} ms.`
+                : '') +
+            (el.voice.checked && said
+              ? ` Voice: ${heard && speaker ? speaker.trim() : 'the browser'}.` +
+                (trouble && !heard ? ' ' + trouble : '')
+              : ''),
+          !!trouble && !heard,
         );
     } catch (error) {
       if (error.name === 'AbortError') {
@@ -377,9 +715,84 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
     el.meter.firstElementChild.style.width = '0';
   }
 
+  // The last ROOM_SECONDS of the mic, kept only while the face is silent so it never hears itself.
+  function roomSound() {
+    if (!el.hearroom.checked || !ctx || roomSamples < ctx.sampleRate) return null;
+    const heard = new Float32Array(roomSamples);
+    let offset = 0;
+    for (const chunk of room) {
+      heard.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return heard;
+  }
+
+  // One door for both: `local` is the device's own choice as a punch lands (react() below);
+  // without it this is OMNI's set_expression call, which has the last word. The chip says which.
+  function wear(emotion, intensity, local = null) {
+    if (!expression?.set(emotion, intensity, { restart: !!local?.restart })) return;
+    // A guess only counts against the answer to the same punch, not one from a turn ago.
+    const about = !local && guess && performance.now() - guess.at < 8000 ? guess : null,
+      who = local ? 'instant' : verdict(about, emotion);
+    el.mood.textContent = `${EXPRESSION_ICONS[emotion] || ''} ${emotion} · ${who}`;
+    el.mood.title = local
+      ? `Chosen on this device the moment the punch landed (${local.why}). OMNI's set_expression call confirms or corrects it.`
+      : 'Set by the OMNI model through a set_expression tool call' +
+        (about
+          ? `. The device had chosen ${about.emotion} when the punch landed.`
+          : '');
+    el.mood.hidden = false;
+    clearTimeout(moodTimer);
+    moodTimer = setTimeout(() => (el.mood.hidden = true), 7000);
+    if (about) {
+      // How often the device and the model agree, and how long the face used to wait for this.
+      const agreed = about.emotion === emotion;
+      obs.count('face.expression.verdict', {
+        local: about.emotion,
+        omni: emotion,
+        agreed,
+      });
+      obs.metric(
+        'face.expression.omni_delay',
+        performance.now() - about.at,
+        'millisecond',
+        { agreed },
+      );
+    }
+    if (!local) guess = null;
+  }
+
+  // The face reacts the instant it is hit, from what this device measured, as the grunt does for
+  // the voice (instant-expression.js). Returns what it chose, or null if it left the face alone.
+  function react(triggers, now) {
+    if (!enabled || mode !== 'face' || !el.instant.checked || !expression) return null;
+    const choice = instant.react(stats.snapshot(now), triggers, expression.showing);
+    if (!choice) return null;
+    wear(choice.emotion, choice.intensity, choice);
+    const landed = window.__lastContact?.time;
+    if (Number.isFinite(landed))
+      obs.metric(
+        'face.expression.instant_latency',
+        performance.now() - landed,
+        'millisecond',
+        { emotion: choice.emotion, why: choice.why },
+      );
+    return { ...choice, at: now };
+  }
+
   function onAudio(chunk) {
     if (!enabled || !ctx || !gate) return;
     const now = performance.now();
+    if (now < gruntUntil) return;
+    if (busy || speaking()) {
+      room = [];
+      roomSamples = 0;
+    } else if (el.hearroom.checked) {
+      room.push(chunk);
+      roomSamples += chunk.length;
+      while (roomSamples - room[0].length >= ctx.sampleRate * ROOM_SECONDS)
+        roomSamples -= room.shift().length;
+    }
     if (interaction === 'ambient' && (busy || speaking() || now < ambientReadyAt)) {
       if (!ignoringAudio) resetListening();
       ignoringAudio = true;
@@ -460,11 +873,13 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
       // leaf tap, so neither the speakers nor the LiveKit guest stream are affected.
       mouth = createMouthSignal(ctx, out);
       synthetic = createSyntheticSignal();
+      expression = createExpressionSignal();
       window.__faceSpeech = {
         read: (dt) => {
           const a = mouth.read(dt),
             b = synthetic.read(dt);
-          return a.open >= b.open ? a : b;
+          // Speech owns the jaw; the expression OMNI chose fills whatever the voice is not using.
+          return blendMouth(a.open >= b.open ? a : b, expression.read());
         },
       };
       gate = new VoiceGate();
@@ -508,6 +923,7 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
         status('No microphone (' + error.name + '). Typed questions still work.', true);
         obs.warn('coach.mic_unavailable', { reason: error.name });
       }
+      grunts.load(audioContext, el.omnivoice.value);
       obs.crumb('coach', 'started', {
         vision: el.vision.checked,
         voice: el.voice.checked,
@@ -537,10 +953,15 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
     ctx?.close();
     mouth?.dispose();
     synthetic?.dispose();
-    mouth = synthetic = null;
+    mouth = synthetic = expression = null;
+    room = [];
+    roomSamples = 0;
+    clearTimeout(moodTimer);
+    el.mood.hidden = true;
     window.__faceSpeech = null;
     ctx = mic = node = out = streamOut = null;
     frames = [];
+    seeing = false;
     resetListening();
     ignoringAudio = false;
     el.meter.firstElementChild.style.width = '0';
@@ -551,6 +972,11 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
   el.toggle.onclick = () => (enabled ? stop() : start());
   el.vision.onchange = () => {
     if (!el.vision.checked) frames = [];
+    paint();
+  };
+  el.hearroom.onchange = () => {
+    room = [];
+    roomSamples = 0;
     paint();
   };
   el.interaction.onchange = () => {
@@ -568,8 +994,16 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
         : 'Ambient mode. Replies finish before listening.',
     );
   };
-  // Switching who is talking cuts the current line off and drops the history: the two personas
-  // would otherwise read each other's turns back and answer in the wrong voice.
+  // A new cast member must not inherit the previous speaker's wording or queued reply.
+  function resetDialogue() {
+    controller?.abort();
+    stopSpeaking();
+    resetListening();
+    history = [];
+    dialogueTurn = 0;
+    el.log.replaceChildren();
+  }
+
   function selectMode(nextMode) {
     if (mode === nextMode) return;
     mode = nextMode;
@@ -578,11 +1012,9 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
     } catch {
       /* private mode */
     }
-    controller?.abort();
-    stopSpeaking();
-    history = [];
-    el.log.replaceChildren();
+    resetDialogue();
     paint();
+    fillVoices();
     status(
       enabled
         ? `Switched to ${voice().label.toLowerCase()}. Carry on.`
@@ -603,6 +1035,41 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
   };
   el.ask.onkeyup = (e) => e.stopPropagation();
   el.key.onkeydown = (e) => e.stopPropagation();
+  el.elevenkey.onkeydown = (e) => e.stopPropagation();
+  el.elevenkey.onkeyup = (e) => e.stopPropagation();
+  el.omnivoice.onchange = () => {
+    keep(OMNI_VOICE_KEY + mode, el.omnivoice.value);
+    resetDialogue();
+    describeVoice();
+    if (ctx) grunts.load(ctx, el.omnivoice.value);
+  };
+  el.backupvoice.onchange = () => {
+    keep(BACKUP_VOICE_KEY + mode, el.backupvoice.value);
+    describeVoice();
+  };
+  el.preferbackup.onchange = () => {
+    keep(PREFER_BACKUP_KEY, el.preferbackup.checked ? '1' : '0');
+    describeVoice();
+  };
+  el.hearomni.onclick = () => hear('omni');
+  el.hearbackup.onclick = () => hear('elevenlabs');
+  el.elevensave.onclick = async () => {
+    const apiKey = el.elevenkey.value.trim();
+    if (!apiKey) return;
+    el.elevenkey.value = '';
+    try {
+      const r = await fetch(api + '/sponsors/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ group: 'elevenlabs', apiKey }),
+      });
+      if (!r.ok) throw new Error((await r.json()).error);
+      await loadVoices();
+      status('ElevenLabs key saved on this computer. Press Hear it to check it.');
+    } catch (error) {
+      status(error.message, true);
+    }
+  };
   el.save.onclick = async () => {
     const apiKey = el.key.value.trim();
     if (!apiKey) return;
@@ -622,6 +1089,7 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
     }
   };
   paint();
+  loadVoices();
 
   return {
     startFace() {
@@ -635,20 +1103,59 @@ export function createCornerman({ api, panel, config, stats, refreshConfig, onMo
     // never over a person who is speaking, and never back-to-back.
     onPunch(triggers) {
       sinceTurn++;
+      const now = performance.now(),
+        // First, so nothing is in its way: the look, on this device, as the punch lands.
+        local = react(triggers, now),
+        wasBusy = busy;
       if (
-        !enabled ||
-        !el.proactive.checked ||
-        busy ||
-        gate?.speaking ||
-        speaking() ||
-        performance.now() - lastTurnAt < QUIET_AFTER_TURN_MS
+        enabled &&
+        el.proactive.checked &&
+        !busy &&
+        !gate?.speaking &&
+        !speaking() &&
+        now - lastTurnAt >= QUIET_AFTER_TURN_MS &&
+        (triggers.length || sinceTurn >= PUNCHES_PER_CUE)
       )
-        return;
-      if (triggers.length || sinceTurn >= PUNCHES_PER_CUE)
+        // First, because it samples the room sound as it starts, before the grunt is in the air.
         turn({
           trigger:
             triggers[0] || `${PUNCHES_PER_CUE} punches since it last said anything`,
         });
+      // turn() takes `busy` before its first await: this punch is the one OMNI is being asked
+      // about, so its guess is the one OMNI's answer will be held against.
+      if (local && !wasBusy && busy) guess = local;
+      // The instant answer, from memory, in its own OMNI voice. Never over its own sentence or a
+      // person who is talking; while a reply is still on its way is exactly when it helps most.
+      if (
+        enabled &&
+        mode === 'face' &&
+        el.voice.checked &&
+        el.grunt.checked &&
+        !speaking() &&
+        !gate?.speaking &&
+        now - lastGruntAt >= GRUNT_GAP_MS
+      ) {
+        const level = gruntLevel(stats.snapshot(now), triggers),
+          seconds = grunts.play(ctx, out, el.omnivoice.value, level);
+        if (seconds) {
+          // The badge says "cached, <50 ms". This is that number: the punch landing (main.js
+          // stamps it) to the grunt being handed to the audio clock, plus the output latency.
+          const landed = window.__lastContact?.time;
+          if (Number.isFinite(landed))
+            obs.metric(
+              'face.grunt_latency',
+              performance.now() -
+                landed +
+                (ctx.outputLatency || ctx.baseLatency || 0) * 1000,
+              'millisecond',
+              { level, voice: el.omnivoice.value },
+            );
+          lastGruntAt = now;
+          gruntUntil = now + seconds * 1000 + 250;
+          // The spoken line waits its turn: "Oof! ... that one actually rattled me."
+          nextTime = Math.max(nextTime, ctx.currentTime + seconds + 0.05);
+        }
+      }
     },
     get outputStream() {
       return streamOut?.stream || null;

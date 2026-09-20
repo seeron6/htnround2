@@ -799,25 +799,44 @@ dialog ol {
 }
 
 #face-scan-dialog {
-  width: min(680px, 94vw);
+  width: min(920px, calc(100vw - 32px));
+  max-width: none;
+  max-height: calc(100dvh - 32px);
+  margin: auto;
+  padding: clamp(16px, 3vw, 29px);
+}
+#face-scan-dialog [hidden] {
+  display: none !important;
+}
+.face-capture-media {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
+  gap: 16px;
+  align-items: start;
+}
+.face-capture-media figure {
+  min-width: 0;
+  margin: 0;
+  text-align: center;
+}
+.face-capture-media figcaption {
+  margin-top: 8px;
+  font-size: 12px;
+}
+#face-scan-video,
+#face-scan-preview,
+#face-source-video {
+  display: block;
+  width: min(100%, calc(60dvh * var(--capture-aspect, 0.75)));
+  height: auto;
+  max-height: none;
+  margin: 0 auto;
+  object-fit: contain;
+  background: #192c24;
+  border-radius: 8px;
 }
 #face-scan-video {
-  display: block;
-  width: 100%;
-  height: 240px;
-  object-fit: contain;
-  background: #192c24;
-  border-radius: 8px;
   transform: scaleX(-1);
-}
-#face-scan-preview {
-  display: block;
-  width: 100%;
-  height: 110px;
-  object-fit: contain;
-  background: #192c24;
-  margin-top: 8px;
-  border-radius: 8px;
 }
 .face-coverage {
   font-size: 13px;
@@ -1522,6 +1541,12 @@ kbd { border: 1px solid #555; background: #0006; color: #fff; border-radius: 0; 
 
 /* Toast, busy overlay, dialogs. */
 .toast { position: fixed; bottom: 32px; background: #000; color: #fff; border: 1px solid #000; border-radius: 0; z-index: 60; }
+/* The demo HUD's key-hints row sits at bottom: 24px and is 31px tall on a wide stage, but wraps
+   to three rows (88px, topping out at 112px) as the stage narrows toward its 900px hide point.
+   Lift the toast clear of it while the demo is focused so messages stay readable. */
+body.demo-focused .toast { bottom: 124px; }
+@media (min-width: 1150px) { body.demo-focused .toast { bottom: 68px; } }
+@media (max-width: 900px) { body.demo-focused .toast { bottom: 32px; } }
 .busy-overlay { background: #000e; color: #fff; }
 .spinner { border-color: #ffffff44; border-top-color: #fff; }
 dialog { background: #fff; border: 1px solid #000; color: #000; border-radius: 0; box-shadow: 0 25px 100px #0006; }
@@ -1774,4 +1799,3 @@ body.immersive.camera-open .app-shell .col-left aside .panel-section { display: 
 body.immersive.camera-open .app-shell .col-left aside .panel-section:has(#webcam) { display: block !important; padding: 0; }
 body.immersive.camera-open .app-shell .col-left aside .panel-section:has(#webcam) > *:not(.camera-view):not(h2) { display: none !important; }
 body.immersive.camera-open .app-shell .col-left aside .panel-section:has(#webcam) h2 { color: #fff; margin: 0 0 6px; }
-

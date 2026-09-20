@@ -34,6 +34,55 @@ class CaptureTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_head_name_survives_restart_append_and_rename_without_reordering(self):
+        created = self.store.create(
+            capture_region='head', name='  Alex   with glasses  '
+        )
+        identifier = created['id']
+        self.assertEqual(created['name'], 'Alex with glasses')
+        self.store.append(identifier, [frame()])
+        before = next(scan for scan in self.store.list() if scan['id'] == identifier)
+        capture_path = self.store.folder(identifier) / 'capture.json'
+        capture_before = capture_path.read_bytes()
+        self.store.rename(identifier, 'Alex — no glasses')
+        again = FaceStore(self.store.root)
+        renamed = next(scan for scan in again.list() if scan['id'] == identifier)
+        self.assertEqual(renamed['name'], 'Alex — no glasses')
+        self.assertEqual(renamed['savedAt'], before['savedAt'])
+        self.assertEqual(capture_path.read_bytes(), capture_before)
+        self.assertEqual(renamed['frames'], 1)
+        self.assertEqual(again.name(self.id), '')
+
+    def test_invalid_head_names_leave_saved_name_unchanged(self):
+        self.store.rename(self.id, 'Original')
+        for name in ('', '   ', 'a' * 81, None, 42, {'name': 'Invalid'}):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    self.store.rename(self.id, name)
+                self.assertEqual(self.store.name(self.id), 'Original')
+        with self.assertRaises(ValueError):
+            self.store.create(name=' ')
+        self.assertEqual(len(self.store.list()), 1)
+
+    def test_rename_route_and_status_return_persisted_name(self):
+        body = json.dumps({'id': self.id, 'name': 'Sam <glasses> & hair'}).encode()
+        handler = SimpleNamespace(
+            command='POST',
+            headers={
+                'Content-Type': 'application/json',
+                'Content-Length': str(len(body)),
+            },
+            rfile=io.BytesIO(body),
+        )
+        code, result = self.store.route(handler, urlparse('/api/face-rename'))
+        self.assertEqual(code, 200)
+        self.assertEqual(result['name'], 'Sam <glasses> & hair')
+        handler.command = 'GET'
+        _, status = self.store.route(
+            handler, urlparse('/api/face-status?id=' + self.id)
+        )
+        self.assertEqual(status['name'], result['name'])
+
     def test_asset_requests_pin_an_accepted_bundle_after_failed_rebuild(self):
         folder = self.store.folder(self.id)
         bundle(folder)
@@ -134,7 +183,7 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(self.store.list()[0]['frames'], 1)
 
     def test_rear_frames_are_retained_without_inventing_face_landmarks(self):
-        identifier = self.store.create(capture_region='head')['id']
+        identifier = self.id
         rear = frame()
         rear.update(yaw=None, landmarks=None, timeSeconds=24.5)
         self.store.append(identifier, [frame(-30), rear, frame(30)])
@@ -144,12 +193,37 @@ class CaptureTests(unittest.TestCase):
         self.assertIsNone(record['landmarks'])
         self.assertIsNone(record['yaw'])
         self.assertEqual(record['viewKind'], 'head-only')
+        legacy = self.store.create(capture_region='face')['id']
         with self.assertRaises(ValueError):
-            self.store.append(self.id, [rear])
+            self.store.append(legacy, [rear])
         from face_pipeline import coverage
 
         self.assertEqual(coverage([rear])['landmarkViews'], 0)
         self.assertEqual(coverage([rear])['span'], 0)
+
+    def test_capture_api_defaults_to_whole_head(self):
+        body = b'{}'
+        handler = SimpleNamespace(
+            command='POST',
+            headers={
+                'Content-Type': 'application/json',
+                'Content-Length': str(len(body)),
+            },
+            rfile=io.BytesIO(body),
+        )
+        code, result = self.store.route(handler, urlparse('/api/face-captures'))
+        self.assertEqual(code, 201)
+        folder = self.store.folder(result['id'])
+        self.assertEqual(
+            json.loads((folder / 'capture.json').read_text())['captureRegion'], 'head'
+        )
+        rear = frame()
+        rear.update(yaw=None, landmarks=None)
+        self.store.append(result['id'], [rear])
+        self.assertEqual(
+            json.loads((folder / 'capture.json').read_text())['frames'][0]['viewKind'],
+            'head-only',
+        )
 
     def test_capture_gate_rejects_single_photo_and_frontal_only(self):
         self.store.append(self.id, [frame()])
@@ -159,6 +233,19 @@ class CaptureTests(unittest.TestCase):
             self.store.append(self.id, [frame()] * 6)
         with self.assertRaisesRegex(ValueError, 'both sides'):
             self.store.train(self.id, False)
+
+    def test_face_only_capture_cannot_start_a_full_head_build(self):
+        identifier = self.store.create(capture_region='face')['id']
+        for _ in range(8):
+            self.store.append(identifier, [frame(-30), frame(), frame(30)])
+        before = (self.store.folder(identifier) / 'status.json').read_bytes()
+        with patch('face_pipeline.subprocess.Popen') as launch:
+            with self.assertRaisesRegex(ValueError, 'whole-head'):
+                self.store.train(identifier, False)
+            launch.assert_not_called()
+        self.assertEqual(
+            (self.store.folder(identifier) / 'status.json').read_bytes(), before
+        )
 
     def test_video_timing_persists_without_invalidating_capture_hash(self):
         from pipeline_timing import PipelineTimer
@@ -190,6 +277,53 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual((path / 'capture.json').read_bytes(), before)
         with self.assertRaises(ValueError):
             self.store.timing(self.id, {'kind': 'load', 'seconds': float('nan')})
+
+    def test_upload_clock_and_ready_observation_are_persisted_independently(self):
+        from face_pipeline import atomic
+
+        metadata = {
+            'kind': 'video',
+            'filename': 'sample.mov',
+            'durationSeconds': 15.4,
+            'extractionSeconds': 0,
+            'extractionComplete': False,
+            'uploadStartedAt': 100,
+        }
+        before = (self.store.folder(self.id) / 'capture.json').read_bytes()
+        self.store.timing(self.id, metadata)
+        self.store.timing(
+            self.id,
+            {
+                **metadata,
+                'uploadStartedAt': 120,
+                'extractionSeconds': 20,
+                'extractionComplete': True,
+            },
+        )
+        atomic(
+            self.store.folder(self.id) / 'timing.json',
+            {
+                'status': 'complete',
+                'requestedAt': 122,
+                'reconstructionSeconds': 79,
+            },
+        )
+        self.store.timing(self.id, {'kind': 'ready', 'at': 204})
+        self.store.timing(self.id, {'kind': 'ready', 'at': 202.5})
+        self.store.timing(self.id, {'kind': 'ready', 'at': 210})
+        result = self.store.timing(self.id)
+        self.assertEqual(result['source']['uploadStartedAt'], 100)
+        self.assertEqual(result['timing']['readyObservedAt'], 202.5)
+        self.assertEqual(
+            (self.store.folder(self.id) / 'capture.json').read_bytes(), before
+        )
+        for invalid in [float('nan'), float('inf'), -1, True]:
+            with self.assertRaises(ValueError):
+                self.store.timing(self.id, {**metadata, 'uploadStartedAt': invalid})
+            with self.assertRaises(ValueError):
+                self.store.timing(self.id, {'kind': 'ready', 'at': invalid})
+        with self.assertRaisesRegex(ValueError, 'precedes completion'):
+            self.store.timing(self.id, {'kind': 'ready', 'at': 150})
 
     def test_saved_video_supports_seeking_and_rejects_partial_uploads(self):
         self.store.timing(

@@ -68,6 +68,7 @@ export class SurfaceAppearance extends THREE.Mesh {
     this.name = 'Textured editable surface';
     this.mapping = mapping;
     this.atlas = atlas;
+    this.shadeMouth(atlas.shade);
     this.frustumCulled = false;
     this.updateSurface(
       source.attributes.position.array,
@@ -98,6 +99,29 @@ export class SurfaceAppearance extends THREE.Mesh {
           );
       };
     this.material.customProgramCacheKey = () => 'photographic-punching-face-shading-v1';
+  }
+
+  // The inside of a mouth (src/lip-topology.js) is darkened with depth through
+  // vertex colour. `shade` lists simulation vertices; it is kept on the atlas so a
+  // saved session restores it.
+  shadeMouth(shade) {
+    if (!shade?.vertices?.length) {
+      delete this.atlas.shade;
+      this.geometry.deleteAttribute('color');
+      this.material.vertexColors = false;
+      this.material.needsUpdate = true;
+      return;
+    }
+    this.atlas.shade = shade;
+    const values = new Map(shade.vertices.map((v, i) => [v, shade.values[i]])),
+      color = new Float32Array(this.mapping.length * 3).fill(1);
+    for (let i = 0; i < this.mapping.length; i++) {
+      const value = values.get(this.mapping[i]);
+      if (value !== undefined) color.fill(value, i * 3, i * 3 + 3);
+    }
+    this.geometry.setAttribute('color', new THREE.BufferAttribute(color, 3));
+    this.material.vertexColors = true;
+    this.material.needsUpdate = true;
   }
 
   remap(array) {

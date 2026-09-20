@@ -107,6 +107,8 @@ export default defineConfig({
       input: {
         main: fileURLToPath(new URL('./index.html', import.meta.url)),
         design: fileURLToPath(new URL('./design.html', import.meta.url)),
+        arms: fileURLToPath(new URL('./arm-review.html', import.meta.url)),
+        comparison: fileURLToPath(new URL('./engine-comparison.html', import.meta.url)),
       },
     },
   },

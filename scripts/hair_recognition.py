@@ -15,8 +15,9 @@ from PIL import Image
 from face_pipeline import atomic
 from openai_capture import request
 from scripts.astra_head_completion import SCHEMA as HEAD_SCHEMA, obj, num, POINT
+from scripts.parallel_annotations import request_views
 
-VERSION = 1
+VERSION = 2
 MODEL = 'gpt-6-astra'
 SCHEMA = obj(
     {
@@ -132,13 +133,17 @@ def recognize_hair(folder, completion):
         'spend effort on invisible strand roots.'
     )
     content[0]['text'] = prompt
-    result = request(
+    result = request_views(
         content,
         SCHEMA,
+        [view['filename'] for view in views],
+        request,
+        label='hair',
+        cache=folder / 'annotation-cache' / 'hair',
         model_override=MODEL,
         reasoning='low',
         max_output_tokens=32000,
-        timeout=600,
+        timeout=90,
     )
     if len(result['views']) != len(views) or {
         v['filename'] for v in result['views']

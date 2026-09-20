@@ -1,9 +1,25 @@
 import { timingRows } from './pipeline-timing.js';
 import { captureCoverage } from './face-quality.js';
 import { EngineChoice } from './meshy-engine.js';
+import { requestHeadName, nameFromFile } from './head-name.js';
+import { renameHead } from './model-library.js';
 import { acknowledgeScanJob, forgetScanJobs, trackScanJob } from './scan-jobs.js';
 import qualityURL from './face-quality.js?url';
 const $ = (id) => document.getElementById(id);
+const EMPTY_SCAN_FEEDBACK =
+  'Record your head, upload a video, or import photos. Your full head builds automatically when capture or import finishes. Imported video and extracted frames stay in this local project.';
+const frameSize = (width, height) => {
+  const scale = Math.min(
+    1,
+    1280 / Math.max(width, height),
+    960 / Math.min(width, height),
+  );
+  return [Math.round(width * scale), Math.round(height * scale)];
+};
+const sizePreview = (element, width, height) => {
+  if (width > 0 && height > 0)
+    element.style.setProperty('--capture-aspect', width / height);
+};
 const asDataURL = (blob) =>
   new Promise((resolve, reject) => {
     const r = new FileReader();
@@ -57,29 +73,32 @@ export class FaceCapture {
           upright. Use even light and pause briefly at each angle. A phone video filmed
           around a seated, still person also works.
         </p>
-        <video
-          id="face-scan-video"
-          playsinline
-          muted
-          autoplay
-          aria-label="Face capture preview"
-        ></video
-        ><canvas
-          id="face-scan-preview"
-          width="480"
-          height="270"
-          aria-label="Last saved head and hair crop"
-        ></canvas>
+        <div class="face-capture-media">
+          <figure id="face-camera-view" hidden>
+            <video
+              id="face-scan-video"
+              playsinline
+              muted
+              autoplay
+              aria-label="Face capture preview"
+            ></video>
+            <figcaption>Live camera · keep your head upright</figcaption>
+          </figure>
+          <figure id="face-saved-view" hidden>
+            <canvas
+              id="face-scan-preview"
+              aria-label="Last saved head and hair crop"
+            ></canvas>
+            <figcaption>Last saved view</figcaption>
+          </figure>
+        </div>
         <div class="face-coverage" id="face-coverage">
           0 saved views · front ○ · side A ○ · side B ○
         </div>
-        <p class="note" id="face-scan-feedback" role="status">
-          The camera stays off until you press Record. Imported video and extracted
-          frames stay in this local project.
-        </p>
+        <p class="note" id="face-scan-feedback" role="status">${EMPTY_SCAN_FEEDBACK}</p>
         <div class="row">
           <button id="face-scan-record" class="primary">Record 360°</button
-          ><button id="face-scan-stop" disabled>Stop & save</button>
+          ><button id="face-scan-stop" disabled>Finish recording</button>
         </div>
         <button id="face-scan-video-import" class="full small" style="margin-top:12px">
           Upload video</button
@@ -96,25 +115,27 @@ export class FaceCapture {
           multiple
           hidden
         /><label class="check"
-          >AI head completion (slower)
+          >AI detail refinement (slower)
           <input
             type="checkbox"
             id="face-cloud-review"
             ${import.meta.env.VITE_CONTACT_FAST_CAPTURE === '1' ? '' : 'checked'}
         /></label>
         <p class="muted">
-          Create 3D face sends selected cropped views to Astra to estimate missing head
-          regions, hair type, hairstyle, strand controls, hair masks, glasses masks,
-          visible ear landmarks, and eye material parameters. Eye crops are checked for
-          usable iris detail; Astra generates missing detail when it cannot be scanned.
-          For glasses, it can send up to three cropped views to the image API to
-          estimate hidden skin and remove lens artifacts. The edited region must pass
-          source-image alignment checks. If rear views are missing, it can also send
-          three views for a labeled rear prediction. Face geometry, hair silhouette
+          AI detail refinement sends selected cropped views to Astra to estimate missing
+          head regions, hair type, hairstyle, strand controls, hair masks, glasses
+          masks, visible ear landmarks, and eye material parameters. Eye crops are
+          checked for usable iris detail; Astra generates missing detail when it cannot
+          be scanned. For glasses, it can send up to three cropped views to the image
+          API to estimate hidden skin and remove lens artifacts. The edited region must
+          pass source-image alignment checks. If rear views are missing, it can also
+          send three views for a labeled rear prediction. Face geometry, hair silhouette
           fitting, texture baking and Newton physics run locally. At least 24
           overlapping views, including 12 with visible facial landmarks, are required.
-          Camera recovery verifies angular coverage; a saved rear-facing frame alone
-          does not prove a complete 360° reconstruction.
+          Full-head geometry and materials are always completed, including with AI
+          refinement off. Unseen regions use labeled estimates. Camera recovery verifies
+          angular coverage; a saved rear-facing frame alone does not prove a complete
+          360° reconstruction.
         </p>
         <section id="face-timing" class="pipeline-timing" hidden>
           <h2>Video to model</h2>
@@ -129,19 +150,23 @@ export class FaceCapture {
           ></video>
           <dl id="face-timing-rows"></dl>
           <p class="muted">
-            Measured processing time. Recording length and time spent waiting to press
-            Create are excluded.
+            Upload to model ready is elapsed time from selecting the video until the
+            finished model is detected, including upload, processing and status checks.
+            Loading into the scene is measured separately.
           </p>
         </section>
-        <button id="face-scan-build" class="primary full" disabled>
-          Create 3D face
-        </button>
+        <details>
+          <summary>Manual build / retry</summary>
+          <button id="face-scan-build" class="primary full" disabled>
+            Create full head
+          </button>
+        </details>
         <p class="note" id="face-job-state" role="status">No reconstruction started.</p>
         <button id="face-scan-background" class="primary full" hidden>
           Use another head while this builds
         </button>
         <div class="row">
-          <button id="face-scan-load" disabled>Load face</button
+          <button id="face-scan-load" disabled>Load head</button
           ><button id="face-scan-delete" disabled>Delete scan</button>
         </div>
         <label class="controls-label" for="face-scan-saved">Saved scans</label
@@ -197,8 +222,14 @@ export class FaceCapture {
     );
     // Local pipeline or Meshy cloud for this scan (src/meshy-engine.js). build, poll and load defer to it.
     this.engines = new EngineChoice(this);
+    for (const id of ['face-scan-video', 'face-source-video']) {
+      const video = $(id);
+      const resize = () => sizePreview(video, video.videoWidth, video.videoHeight);
+      video.addEventListener('loadedmetadata', resize);
+      video.addEventListener('resize', resize);
+    }
     $('face-scan-record').onclick = () => this.start().catch((e) => this.fail(e));
-    $('face-scan-stop').onclick = () => this.stop().catch((e) => this.fail(e));
+    $('face-scan-stop').onclick = () => this.finishCapture().catch((e) => this.fail(e));
     $('face-scan-close').onclick = () => this.close().catch((e) => this.fail(e));
     $('face-scan-background').onclick = async () => {
       try {
@@ -227,6 +258,23 @@ export class FaceCapture {
         .finally(() => (e.target.value = ''));
     $('face-scan-saved').onchange = () =>
       this.select($('face-scan-saved').value).catch((e) => this.fail(e));
+    const rename = document.createElement('button');
+    rename.id = 'face-scan-rename';
+    rename.textContent = 'Rename selected head';
+    rename.onclick = async () => {
+      const id = this.id;
+      if (!id) return;
+      await requestHeadName({
+        name: this.saved?.find((scan) => scan.id === id)?.name || '',
+        rename: true,
+        save: (name) => renameHead(id, name),
+      });
+    };
+    $('face-scan-saved').after(rename);
+    window.addEventListener('punching-face-library-changed', () => {
+      if ($('face-scan-dialog').open && !this.running && !this.loading)
+        this.refresh().catch((e) => this.fail(e));
+    });
     $('face-api-save').onclick = async () => {
       try {
         await api('openai-config', { apiKey: $('face-api-key').value.trim() });
@@ -274,7 +322,13 @@ export class FaceCapture {
       url = source?.videoStored ? '/api/face-video?id=' + this.id : null;
     preview.hidden = !url;
     if (url && preview.getAttribute('src') !== url) preview.src = url;
-    if (preview.hidden) preview.pause();
+    if (preview.hidden) {
+      preview.pause();
+      if (preview.hasAttribute('src')) {
+        preview.removeAttribute('src');
+        preview.load();
+      }
+    }
   }
 
   async open() {
@@ -300,12 +354,13 @@ export class FaceCapture {
     for (const scan of this.saved)
       select.add(
         new Option(
-          `${scan.testFixture ? 'Public test · ' : ''}${scan.frames} views · ${scan.status} · ${new Date(scan.savedAt * 1000).toLocaleString()}`,
+          `${scan.testFixture ? 'Public test · ' : ''}${scan.name ? scan.name + ' · ' : ''}${scan.frames} views · ${scan.evidence?.includesHairCapture === false ? 'needs whole-head capture' : scan.status} · ${new Date(scan.savedAt * 1000).toLocaleString()}`,
           scan.id,
         ),
       );
     select.value = this.id || '';
-    if (!this.id && this.saved[0]) await this.select(this.saved[0].id);
+    // Saved scans stay available, but a fresh session starts with an empty upload.
+    if (!this.id) await this.select('');
   }
 
   controls() {
@@ -327,11 +382,20 @@ export class FaceCapture {
     ])
       $(id).disabled = !!busy;
     $('face-scan-stop').disabled = !this.running;
+    $('face-scan-stop').textContent = this.loading ? 'Stop import' : 'Finish recording';
+    $('face-scan-rename').disabled = !this.id || !!busy;
     $('face-scan-delete').disabled = !this.id || !!busy || !!this.jobRunning;
     $('face-scan-background').hidden = !this.jobRunning;
     $('face-scan-background').disabled = !!busy;
+    const faceOnly =
+      this.saved?.find((scan) => scan.id === this.id)?.evidence?.includesHairCapture ===
+      false;
     $('face-scan-build').disabled =
-      !!busy || !this.id || this.count < this.engines.minimumViews || this.jobRunning;
+      !!busy ||
+      !this.id ||
+      this.count < this.engines.minimumViews ||
+      this.jobRunning ||
+      (!this.engines.meshy && faceOnly);
     $('face-scan-load').disabled = !!busy || !this.ready;
   }
 
@@ -361,19 +425,30 @@ export class FaceCapture {
   }
 
   async start() {
+    const name = await requestHeadName();
+    if (name === null) return;
     this.loading = true;
     this.controls();
     try {
       await this.init();
       this.worker.postMessage({ type: 'reset' });
       this.stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+        video: {
+          width: { ideal: 960 },
+          height: { ideal: 1280 },
+          aspectRatio: { ideal: 3 / 4 },
+          facingMode: 'user',
+        },
         audio: false,
       });
       const video = $('face-scan-video');
       video.srcObject = this.stream;
       await video.play();
+      sizePreview(video, video.videoWidth, video.videoHeight);
+      $('face-camera-view').hidden = false;
+      $('face-saved-view').hidden = true;
       const scan = await api('face-captures', {
+        name,
         captureRegion: 'head',
         horizontalFovDegrees: $('face-fov').value ? Number($('face-fov').value) : null,
       });
@@ -390,9 +465,10 @@ export class FaceCapture {
       $('face-job-state').textContent =
         'Each accepted frame is saved immediately on this computer.';
       this.updateCoverage();
-      this.loop();
+      this.loop().catch((e) => this.fail(e));
     } catch (e) {
       this.stream?.getTracks().forEach((t) => t.stop());
+      $('face-camera-view').hidden = true;
       this.worker?.terminate();
       this.worker = null;
       throw e;
@@ -450,8 +526,23 @@ export class FaceCapture {
       this.previous = data.landmarks ? { yaw: data.yaw, pitch: data.pitch } : null;
       const bitmap = await createImageBitmap(data.blob);
       const canvas = $('face-scan-preview');
-      canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
-      canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      // Frame the preview around the head; saved pixels and landmark coordinates
+      // remain in the original image so camera recovery retains one calibration.
+      const bounds = data.bounds || [0, 0, bitmap.width - 1, bitmap.height - 1];
+      const padding = Math.ceil(
+        Math.max(bounds[2] - bounds[0], bounds[3] - bounds[1]) * 0.1,
+      );
+      const x = Math.max(0, bounds[0] - padding),
+        y = Math.max(0, bounds[1] - padding);
+      const width = Math.min(bitmap.width, bounds[2] + padding + 1) - x;
+      const height = Math.min(bitmap.height, bounds[3] + padding + 1) - y;
+      canvas.width = width;
+      canvas.height = height;
+      sizePreview(canvas, width, height);
+      canvas
+        .getContext('2d')
+        .drawImage(bitmap, x, y, width, height, 0, 0, width, height);
+      $('face-saved-view').hidden = false;
       bitmap.close();
       this.updateCoverage();
       $('face-scan-feedback').textContent =
@@ -485,7 +576,7 @@ export class FaceCapture {
       }
       if (this.running) await new Promise((r) => setTimeout(r, 600));
     }
-    if (this.running) await this.stop();
+    if (this.running) await this.finishCapture();
   }
 
   updateCoverage() {
@@ -494,12 +585,57 @@ export class FaceCapture {
       `${this.count || 0} saved views · front ${c.front ? '✓' : '○'} · side A ${c.left ? '✓' : '○'} · side B ${c.right ? '✓' : '○'} · ${c.headOnly} profile/rear views saved (angles pending reconstruction)`;
   }
 
-  async stop() {
+  async finishCapture() {
+    // Finishing a live recording builds it; stopping an import only cancels it.
+    const completed = this.running && !this.loading;
+    const pending = this.inflight;
+    await this.stop();
+    if (completed) {
+      await pending;
+      await this.buildAutomatically();
+    }
+  }
+
+  async buildAutomatically() {
+    if (
+      !this.id ||
+      this.running ||
+      this.loading ||
+      this.saving ||
+      this.submitting ||
+      this.closing ||
+      this.deleting ||
+      this.jobRunning ||
+      this.ready
+    )
+      return;
+    if (this.count < this.engines.minimumViews) {
+      const message = `${this.count || 0} views saved. At least ${this.engines.minimumViews} usable views are needed to build a head. Record a longer scan or import more overlapping views.`;
+      $('face-scan-feedback').textContent = message;
+      $('face-job-state').textContent = message;
+      return;
+    }
+    if (
+      !this.engines.meshy &&
+      this.saved?.find((scan) => scan.id === this.id)?.evidence?.includesHairCapture ===
+        false
+    )
+      return;
+    await this.build();
+    if (this.jobRunning)
+      $('face-scan-feedback').textContent =
+        'Reconstruction is running in the background.';
+    else if (this.ready) $('face-scan-feedback').textContent = 'Your head is ready.';
+  }
+
+  async stop({ preserveVideoImport = false } = {}) {
+    if (!preserveVideoImport && this.videoImport) this.videoImport.cancelled = true;
     this.running = false;
     this.generation = (this.generation || 0) + 1;
     this.stream?.getTracks().forEach((t) => t.stop());
     this.stream = null;
     $('face-scan-video').srcObject = null;
+    $('face-camera-view').hidden = true;
     try {
       await this.inflight;
     } catch {}
@@ -529,42 +665,49 @@ export class FaceCapture {
 
   fail(e) {
     $('face-scan-feedback').textContent = e.message;
+    // Create sits below the preview, which can be outside the visible dialog.
+    $('face-job-state').textContent = e.message;
     if (this.running) {
       this.running = false;
       this.stream?.getTracks().forEach((t) => t.stop());
       this.stream = null;
+      $('face-camera-view').hidden = true;
     }
     this.controls();
   }
 
   async importPhotos(files) {
     if (!files.length) return;
+    const name = await requestHeadName({ name: nameFromFile(files[0].name) });
+    if (name === null) return;
     await this.stop();
     if (files.length > 240) throw new Error('Import at most 240 overlapping photos.');
     this.loading = true;
     this.controls();
+    let completed = false;
     try {
       await this.init();
       this.worker.postMessage({ type: 'reset' });
       const scan = await api('face-captures', {
         captureRegion: 'head',
+        name,
         horizontalFovDegrees: $('face-fov').value ? Number($('face-fov').value) : null,
       });
       this.id = scan.id;
+      $('face-saved-view').hidden = true;
       this.samples = [];
       this.count = 0;
       this.previous = null;
       this.lastRejection = null;
       this.ready = false;
+      this.jobRunning = false;
       this.running = true;
       this.generation = (this.generation || 0) + 1;
       for (const file of files) {
         if (!this.running) break;
         const original = await createImageBitmap(file);
-        const scale = Math.min(1, 1280 / original.width, 960 / original.height),
-          canvas = document.createElement('canvas');
-        canvas.width = Math.round(original.width * scale);
-        canvas.height = Math.round(original.height * scale);
+        const canvas = document.createElement('canvas');
+        [canvas.width, canvas.height] = frameSize(original.width, original.height);
         canvas.getContext('2d').drawImage(original, 0, 0, canvas.width, canvas.height);
         original.close();
         const generation = this.generation;
@@ -578,21 +721,31 @@ export class FaceCapture {
           this.inflight = null;
         }
       }
+      completed = this.running;
     } finally {
       this.loading = false;
       await this.stop();
     }
+    if (completed) await this.buildAutomatically();
   }
 
   async importVideo(file) {
     if (!file) return;
+    const uploadStartedAt = Date.now() / 1000;
+    const extractionStarted = performance.now();
     if (file.size > 500 * 1024 * 1024)
       throw new Error('Use a video smaller than 500 MB.');
     await this.stop();
-    const extractionStarted = performance.now();
+    // Use the file's name immediately; the saved head can still be renamed later.
+    const name = nameFromFile(file.name);
+    const importRun = { cancelled: false };
+    this.videoImport = importRun;
+    let completed = false;
     this.loading = true;
     this.importingVideo = true;
     this.controls();
+    $('face-scan-feedback').textContent = 'Preparing the uploaded video…';
+    $('face-job-state').textContent = 'Uploading video and preparing face tracking…';
     const video = document.createElement('video'),
       url = URL.createObjectURL(file);
     video.muted = true;
@@ -618,23 +771,29 @@ export class FaceCapture {
         action();
       });
     try {
+      // Model initialization is independent of video upload and native decoding.
+      // Join before analyzing frames; observe early rejection in the meantime.
+      const trackerReady = this.init();
+      trackerReady.catch(() => {});
       await waitFor('loadeddata', () => {
         video.src = url;
         video.load();
       });
+      if (importRun.cancelled) return;
       if (
         !Number.isFinite(video.duration) ||
         video.duration < 3 ||
         video.duration > 300
       )
         throw new Error('Use a head rotation video between 3 seconds and 5 minutes.');
-      await this.init();
-      this.worker.postMessage({ type: 'reset' });
       const scan = await api('face-captures', {
         captureRegion: 'head',
+        name,
         horizontalFovDegrees: $('face-fov').value ? Number($('face-fov').value) : null,
       });
+      if (importRun.cancelled) return;
       this.id = scan.id;
+      $('face-saved-view').hidden = true;
       this.samples = [];
       this.count = 0;
       this.previous = null;
@@ -644,13 +803,12 @@ export class FaceCapture {
       this.running = true;
       this.generation = (this.generation || 0) + 1;
       this.controls();
-      const scale = Math.min(1, 1280 / video.videoWidth, 960 / video.videoHeight),
-        canvas = document.createElement('canvas');
-      canvas.width = Math.round(video.videoWidth * scale);
-      canvas.height = Math.round(video.videoHeight * scale);
+      const canvas = document.createElement('canvas');
+      [canvas.width, canvas.height] = frameSize(video.videoWidth, video.videoHeight);
       this.showTiming(
         {
           filename: file.name,
+          uploadStartedAt,
           durationSeconds: video.duration,
           extractionSeconds: 0,
           extractionComplete: false,
@@ -661,6 +819,7 @@ export class FaceCapture {
         id: this.id,
         kind: 'video',
         filename: file.name,
+        uploadStartedAt,
         durationSeconds: video.duration,
         extractionSeconds: 0,
         extractionComplete: false,
@@ -672,18 +831,36 @@ export class FaceCapture {
       });
       if (!upload.ok)
         throw new Error('The original video could not be retained locally.');
+      if (importRun.cancelled) return;
       let nativeFrames = null;
       try {
         $('face-job-state').textContent = 'Decoding video locally…';
-        nativeFrames = (await api('face-video-frames', { id: this.id })).frames;
+        const decoded = await api('face-video-frames', { id: this.id });
+        // An already-running server may still have the old decoder loaded.
+        // Use browser decoding unless native frames explicitly honor orientation.
+        if (
+          decoded.orientationApplied !== true ||
+          !decoded.width ||
+          !decoded.height ||
+          Math.abs(
+            decoded.width / decoded.height - video.videoWidth / video.videoHeight,
+          ) > 0.01
+        )
+          throw new Error('Native video orientation is unverified.');
+        nativeFrames = decoded.frames;
       } catch (error) {
         console.info('Using browser video decoding:', error.message);
       }
+      if (importRun.cancelled) return;
+      await trackerReady;
+      if (importRun.cancelled) return;
+      this.worker.postMessage({ type: 'reset' });
       const nativeBitmap = async (i) =>
         createImageBitmap(await (await fetch(nativeFrames[i].image)).blob());
       // Imported clips may start behind the head. Locate a frontal view first
       // so the chronological pass can keep the earlier profile/rear frames.
       for (const fraction of [0, 0.8, 0.6, 0.4, 0.2]) {
+        if (importRun.cancelled) return;
         let bitmap;
         if (nativeFrames) {
           bitmap = await nativeBitmap(
@@ -754,13 +931,16 @@ export class FaceCapture {
         id: this.id,
         kind: 'video',
         filename: file.name,
+        uploadStartedAt,
         durationSeconds: video.duration,
         extractionSeconds: (performance.now() - extractionStarted) / 1000,
         extractionComplete: processed === steps,
       });
       this.showTiming(result.source, result.timing);
-      $('face-job-state').textContent =
-        `Video processed. ${this.count} head views saved locally. Create 3D face will verify cameras and fit the head template.`;
+      completed = processed === steps && this.running && !importRun.cancelled;
+      $('face-job-state').textContent = completed
+        ? `Video processed. Starting reconstruction from ${this.count} saved head views…`
+        : `Video extraction stopped. ${this.count} head views saved locally.`;
     } finally {
       video.pause();
       video.removeAttribute('src');
@@ -768,19 +948,30 @@ export class FaceCapture {
       URL.revokeObjectURL(url);
       this.loading = false;
       this.importingVideo = false;
-      await this.stop();
+      await this.stop({ preserveVideoImport: true });
+      if (this.videoImport === importRun) this.videoImport = null;
+    }
+    if (completed && !importRun.cancelled) {
+      await this.buildAutomatically();
     }
   }
 
   async select(id) {
     if (this.running || this.saving) return;
     clearTimeout(this.pollTimer);
+    if (id !== this.id) $('face-saved-view').hidden = true;
     this.id = id || null;
     $('face-scan-saved').value = id || '';
     this.ready = false;
     this.jobRunning = false;
     if (!id) {
+      this.count = 0;
+      this.samples = [];
+      $('face-saved-view').hidden = true;
+      this.updateCoverage();
       this.showTiming(null, null);
+      $('face-scan-feedback').textContent = EMPTY_SCAN_FEEDBACK;
+      $('face-job-state').textContent = 'No reconstruction started.';
       this.controls();
       return;
     }
@@ -797,6 +988,8 @@ export class FaceCapture {
     if (this.submitting) return;
     this.submitting = true;
     this.controls();
+    $('face-job-state').textContent =
+      'Checking saved views and starting reconstruction…';
     try {
       await this.stop();
       const id = this.id;
@@ -828,18 +1021,43 @@ export class FaceCapture {
     if (!current()) return;
     const state = await api('face-status?id=' + id);
     if (!current()) return;
+    if (
+      state.status === 'complete' &&
+      state.photoModel &&
+      state.source?.uploadStartedAt &&
+      !state.timing?.readyObservedAt
+    ) {
+      const at = Date.now() / 1000;
+      state.timing = { ...state.timing, readyObservedAt: at };
+      void api('face-timing', {
+        id,
+        kind: 'ready',
+        at,
+      })
+        .then((observed) => {
+          if (current() && this.timing?.requestedAt === observed.timing?.requestedAt)
+            this.showTiming(observed.source, observed.timing);
+        })
+        // Timing diagnostics must not hide a completed model on an older server.
+        .catch((error) => console.info('Ready timing was not saved:', error.message));
+    }
     const wasRunning = this.jobRunning;
     this.jobRunning = state.status === 'running';
     if (this.jobRunning && !wasRunning)
       trackScanJob({ id, engine: 'local', resume: true });
-    this.ready = state.photoModel === true;
+    const faceOnly = state.evidence?.includesHairCapture === false;
+    this.ready = state.photoModel === true && !faceOnly;
+    if (state.status === 'complete' && this.ready && state.source?.uploadStartedAt)
+      $('face-scan-feedback').textContent = 'Video imported. Your head is ready.';
     this.showTiming(state.source, state.timing);
     const orbit = state.evidence?.orbitCoverage;
     if (orbit)
       $('face-coverage').textContent =
         `${this.count} saved views · ${state.evidence.registeredViews} recovered cameras · ${orbit.recoveredSpanDegrees}° recovered span · ${orbit.registeredRearViews} rear views${orbit.completeOrbit ? ' · complete orbit' : ' · gaps remain estimated'}`;
     $('face-job-state').textContent =
-      state.message +
+      (faceOnly
+        ? 'This older scan contains face-only crops. Record or import whole-head views including hair, ears, both sides and the back.'
+        : state.message) +
       (state.evidence?.cloudReview?.nextCaptureInstruction
         ? ' OpenAI review: ' + state.evidence.cloudReview.nextCaptureInstruction
         : '') +
@@ -917,9 +1135,9 @@ export class FaceCapture {
       const c = $('face-scan-preview');
       c.getContext('2d').clearRect(0, 0, c.width, c.height);
       this.updateCoverage();
+      await this.refresh();
       $('face-job-state').textContent =
         'Scan and its local reconstruction outputs deleted.';
-      await this.refresh();
     } finally {
       this.deleting = false;
       this.controls();

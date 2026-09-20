@@ -1,0 +1,75 @@
+.head-name-dialog {
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  width: min(440px, calc(100vw - 40px));
+  max-height: calc(100dvh - 40px);
+  box-sizing: border-box;
+  padding: 28px;
+  border: 1px solid #c8cec2;
+  border-radius: 22px;
+  background: #f4f5ef;
+  color: #293325;
+  box-shadow: 0 24px 80px #18201240;
+}
+.head-name-dialog::backdrop {
+  background: #17211280;
+  backdrop-filter: blur(5px);
+}
+.head-name-dialog h2 {
+  margin: 0 0 8px;
+  font-size: 26px;
+}
+.head-name-dialog p {
+  margin: 0 0 22px;
+  color: #596352;
+  line-height: 1.5;
+}
+.head-name-dialog label {
+  display: block;
+  margin-bottom: 8px;
+  font-weight: 600;
+}
+.head-name-dialog input {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid #abb6a2;
+  border-radius: 10px;
+  background: white;
+  color: #293325;
+  padding: 12px;
+  font: inherit;
+}
+.head-name-dialog input:focus-visible,
+.head-name-dialog button:focus-visible {
+  outline: 3px solid #6c8758;
+  outline-offset: 3px;
+}
+.head-name-dialog .head-name-error {
+  margin: 10px 0;
+  color: #9c342a;
+}
+.head-name-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 22px;
+}
+.head-name-actions button {
+  padding: 12px 18px;
+  border: 1px solid #bac3b2;
+  border-radius: 10px;
+  background: transparent;
+  color: #293325;
+  font: inherit;
+  cursor: pointer;
+}
+.head-name-actions button[type='submit'] {
+  background: #3c512e;
+  border-color: #3c512e;
+  color: white;
+}
+.head-name-actions button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}

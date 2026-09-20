@@ -7,6 +7,38 @@ import { ImpactPreparation } from './impact-preparation.js';
 
 export const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
 
+// Lightweight arm motor in the browser physics layer. The existing contact path
+// still owns head/Newton collisions; this spring integrates visible arm recoil.
+export class ArmDynamics {
+  constructor() {
+    this.position = new THREE.Vector3();
+    this.velocity = new THREE.Vector3();
+    this.ready = false;
+  }
+  step(target, dt) {
+    if (!this.ready || this.position.distanceTo(target) > 0.6) {
+      this.position.copy(target);
+      this.velocity.set(0, 0, 0);
+      this.ready = true;
+    }
+    let remaining = clamp(dt, 0, 0.05);
+    while (remaining > 1e-8) {
+      const h = Math.min(remaining, 1 / 240);
+      this.velocity.addScaledVector(target.clone().sub(this.position), 1800 * h);
+      this.velocity.multiplyScalar(Math.exp(-72 * h));
+      this.position.addScaledVector(this.velocity, h);
+      remaining -= h;
+    }
+    return this.position;
+  }
+  recoil(strength = 1) {
+    this.velocity.z += clamp(strength, 0, 4) * 0.8;
+  }
+}
+// A full Jaw slider opens a seamed mouth this many times wider than a full spoken
+// "ah" (src/speech-rig.js OPEN_RATIO): about 0.6 of the mouth's width.
+const JAW_SEAM_GAIN = 2;
+
 // Broad phase only: a swept sphere against an expanded head ellipsoid.
 export function sweptEllipsoid(from, to, center, radii, radius = 0.04) {
   const a = from.map((v, i) => (v - center[i]) / (radii[i] + radius));
@@ -228,25 +260,62 @@ export class FaceDynamics {
     ];
   }
 
+  // Lips that were given their own seam (src/lip-topology.js). The speech rig
+  // owns the seam-aware shapes; the Jaw slider borrows its jaw swing.
+  setLipTopology(topology) {
+    this.speechRig.setLipTopology(topology);
+    this._poseRest = null;
+  }
+
+  // The jaw swing for a mouth with a seam, or null. `rigDelta` is a function of
+  // position alone, and the two copies of a seam vertex share a position, so it
+  // can only ever drag both lips the same way. This field knows which lip is
+  // which, so the mouth opens instead of stretching.
+  get seamJaw() {
+    return this.speechRig.lips ? this.speechRig.openBasis : null;
+  }
+
+  // How far the jaw has swung on its hinge, in radians, from speech and the Jaw
+  // slider together; and the hinge it swings on. Null for a mouth without a seam.
+  get jawSwing() {
+    const jaw = this.speechRig.jaw;
+    if (!jaw || !this.seamJaw) return null;
+    return {
+      ...jaw,
+      radians:
+        jaw.angle * ((this.speechRig.openNow || 0) + this.rig.jaw * JAW_SEAM_GAIN),
+    };
+  }
+
   // Manual expressions are constant between edits. Keep double precision here
   // so the final Float32 position rounding matches the uncached calculation.
   poseOffsets() {
-    const key = JSON.stringify(this.rig);
+    const key = JSON.stringify(this.rig),
+      seam = this.seamJaw;
     if (
       this._poseRest !== this.rest ||
       this._poseKey !== key ||
-      this._poseAnchors !== this.anchors
+      this._poseAnchors !== this.anchors ||
+      this._poseSeam !== seam
     ) {
       this._poseOffsets = new Float64Array(this.rest.length);
-      if (Object.values(this.rig).some((value) => value !== 0))
+      if (Object.values(this.rig).some((value) => value !== 0)) {
+        const rig = this.rig;
+        if (seam) this.rig = { ...rig, jaw: 0 };
         for (let i = 0; i < this.rest.length; i += 3)
           this._poseOffsets.set(
             this.rigDelta(this.rest[i], this.rest[i + 1], this.rest[i + 2]),
             i,
           );
+        this.rig = rig;
+        if (seam && rig.jaw)
+          for (let i = 0; i < seam.length; i++)
+            this._poseOffsets[i] += seam[i] * rig.jaw * JAW_SEAM_GAIN;
+      }
       this._poseRest = this.rest;
       this._poseKey = key;
       this._poseAnchors = this.anchors;
+      this._poseSeam = seam;
     }
     return this._poseOffsets;
   }
@@ -254,7 +323,9 @@ export class FaceDynamics {
   step(dt) {
     dt = clamp(dt, 0, 1 / 30);
     this.impactRig.step(dt);
-    this.speechRig.step(dt, this.speechDuck);
+    // The pain rig's gasp parts the lips through the speech rig, which is the
+    // one that knows which lip is which (src/pain-rig.js `painGasp`).
+    this.speechRig.step(dt, this.speechDuck, this.impactRig.gasp);
     const pose = this.poseOffsets();
     for (let i = 0; i < this.rest.length; i += 3) {
       for (let j = 0; j < 3; j++)
@@ -308,8 +379,11 @@ export class FaceDynamics {
               this.velocity[i + j] -= (outward * this.offset[i + j]) / 0.03;
         }
       }
+      // The spring rests wherever the pain rig wants the head: turned away from
+      // the blow with the chin tucked, then back (src/pain-rig.js `headFlinch`).
       this.recoilVelocity
         .addScaledVector(this.recoil, -40 * h)
+        .addScaledVector(this.impactRig.headPose, 40 * h)
         .multiplyScalar(Math.exp(-9 * h));
       this.recoil.addScaledVector(this.recoilVelocity, h);
     }
@@ -420,9 +494,13 @@ export class FaceDynamics {
     for (const name of names) {
       this.rig = { jaw: 0, smile: 0, brow: 0, squint: 0 };
       this.rig[name] = 1;
-      const values = new Float32Array(this.rest.length);
-      for (let i = 0; i < values.length; i += 3)
-        values.set(this.rigDelta(...this.rest.slice(i, i + 3)), i);
+      const values = new Float32Array(this.rest.length),
+        seam = name === 'jaw' ? this.seamJaw : null;
+      if (seam)
+        for (let i = 0; i < seam.length; i++) values[i] = seam[i] * JAW_SEAM_GAIN;
+      else
+        for (let i = 0; i < values.length; i += 3)
+          values.set(this.rigDelta(...this.rest.slice(i, i + 3)), i);
       const attr = new THREE.BufferAttribute(values, 3);
       attr.name = name;
       arrays.push(attr);

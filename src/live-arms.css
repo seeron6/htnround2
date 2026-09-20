@@ -1,0 +1,66 @@
+.stage canvas.live-arm-layer {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 2;
+}
+.live-arm-layer[hidden],
+.arm-camera-controls [hidden] {
+  display: none !important;
+}
+.arm-camera-controls {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0;
+}
+.arm-camera-controls label,
+.punch-camera-label {
+  font-size: 12px;
+}
+.arm-camera-controls select,
+#punch-camera-device {
+  width: 100%;
+  min-width: 0;
+}
+#punch-camera-device {
+  margin-bottom: 8px;
+}
+#body-camera-controls {
+  display: grid;
+  gap: 8px;
+}
+#body-camera-preview {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: contain;
+  border-radius: 8px;
+  background: #151915;
+}
+.arm-mirror-label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.arm-camera-guide {
+  font-size: 12px;
+  line-height: 1.5;
+  border-top: 1px solid #a2ac9b50;
+  padding-top: 10px;
+}
+.arm-camera-guide summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.arm-camera-guide ol {
+  padding-left: 20px;
+  list-style: decimal;
+}
+.arm-camera-guide li,
+.arm-camera-guide p {
+  margin: 10px 0;
+}
+.arm-camera-guide a {
+  text-decoration: underline;
+}

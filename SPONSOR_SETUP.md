@@ -46,6 +46,19 @@ models served include `qwen3.5-omni-flash`, `qwen3.5-omni-plus`, `qwen3.5-omni-p
 
 After changing Sentry settings, restart `npm run dev` and `npm run sponsors` (Python reads the DSN at start-up).
 
+**Sentry is configured on this machine since 2026-09-20** (org `punchingface.sentry.io`, projects `punching-face-web`
+and `punching-face-services`). Do not trust a config file for that: ask.
+
+```bash
+npm run sentry:doctor                                   # must end "ALL PASS: Sentry is on."
+npm run sentry:doctor -- --dsn <DSN> --browser-dsn <DSN>   # on a fresh clone: saves 0600, then checks
+npm run sentry:sink                                     # no network? a loopback stand-in; its DSN is printed
+```
+
+The doctor posts a real envelope and reads the HTTP answer, sends a trace + log + metric from **both** interpreters,
+and checks that each *running* service answers with an `X-Sentry-Trace-Id` header. A service started before the DSN
+was saved is still dark, and says so there. What Sentry found, and the full wiring: [TRACKS/SENTRY.md](TRACKS/SENTRY.md).
+
 ---
 
 ## Guests on other devices (phones, other laptops)
@@ -112,14 +125,14 @@ real speed and zone → talk over it to interrupt → untick *Let the coach see 
 "voice + numbers only" (privacy) → have a teammate join the Arena and land a combo: the coach addresses them by name.
 That last step is the "multi-device collaboration" line in the rubric.
 
-**Sentry (needs ≥ 2 products beyond errors; five are wired).** Tracing (browser → API → subprocess → stages) ·
-Logs (each stage logs with its trace id, so a log line opens its trace) · AI agent monitoring (`gen_ai.*` spans for
-OMNI calls with tokens, first-token latency and frames sent; the SDK also auto-instruments the existing `openai`
-calls, without prompts or images since `send_default_pii` is off) · Session Replay (browser) · Profiling (**Python
-services only**: browser profiling needs a `Document-Policy` response header, i.e. a `vite.config.js` change, which
-was deliberately not made while Codex is editing). **The story must be true:** open Sentry, find
-one real thing, fix it, keep the before/after. Two honest leads seen while building this, *not yet investigated*: a
-single `/physics/step` that took **628 ms** in one tab, and how long `/physics/open` takes after every page reload.
+**Sentry (needs ≥ 2 products beyond errors; seven are wired and live).** Tracing (a person's action is its own
+trace: browser → service → pipeline subprocess or Meshy cloud job) · AI agent monitoring (each turn is one
+`invoke_agent` run: the reply, the expression call and the `set_expression` tool, with time to first token, tokens and
+cost; never prompts, replies, frames or audio) · Session Replay (webcam, images and canvas blocked, conversation and
+names masked, every punch a breadcrumb) · Logs · Profiling (Python continuous + browser) · Metrics · User Feedback.
+**The story is true, and it is in [TRACKS/SENTRY.md](TRACKS/SENTRY.md):** the two leads this section used to list
+were investigated on 2026-09-20. `/physics/open` was never slow (372 ms cold, 137 ms warm); the step loop was the
+problem (35 ms of a 33 ms budget on the live stack, and the same cost with nobody punching), and it has a measured fix.
 
 **LiveKit.** Go live → show the QR → two people join → both land hits, scoreboard splits by name → edit any source
 file so the dev server reloads the host: the session **rejoins by itself** and the guests never leave.
@@ -165,7 +178,8 @@ file so the dev server reloads the host: the session **rejoins by itself** and t
   microphone or speakers exist in the test browser.
 - **Guest hand tracking on a phone.** The detector is unit-tested on synthetic landmarks; camera access was blocked in
   the test browser, so real punches were thrown with the pads. Thresholds may need tuning on a real device.
-- **Anything against real Sentry / LiveKit Cloud.** No accounts were used. Sentry output was captured in memory.
+- **Anything against LiveKit Cloud.** No account was used. (Sentry **is** verified against the real project since
+  2026-09-20: `npm run sentry:doctor` ends ALL PASS, and traces, agent runs, replays and logs were read in its UI.)
 - **Simulcast** was tried and could not be verified headlessly, so it is deliberately not shipped.
 
 **Operational hazards for demo day:**

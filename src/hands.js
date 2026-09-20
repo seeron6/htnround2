@@ -5,6 +5,7 @@ import {
   FaceLandmarker,
 } from '@mediapipe/tasks-vision';
 import { clamp, fistScore } from './physics.js';
+import { palmFrame, trackedPalmFrame } from './hand-orientation.js';
 import {
   calibrateBodyFrame,
   matchHandsToBody,
@@ -36,11 +37,12 @@ const LINKS = [
   [18, 19],
   [19, 20],
 ];
+const EMPTY_ARM_PROFILES = new Map();
 const SEGMENT_COUNT = LINKS.length + 1; // + forearm
 const HAND_POSITION_BUFFER_SIZE = SEGMENT_COUNT * 2 * 3;
 
-// Open vs fist landmark offsets (relative to a hand-center in local space). demoPose lerps
-// between these by `closed` so a Q/E/Space press with the webcam off closes the visible skeleton.
+// Open vs fist landmark offsets (relative to a hand-center in local space).
+// Demo hands default to fists through guard, strike, and recovery.
 const HAND_POSE_OPEN = {
   y: [-0.012, 0.022, 0.016, -0.004],
   z: [0.015, 0.004, -0.022, -0.026],
@@ -87,8 +89,10 @@ export class VirtualHand extends THREE.Group {
     this.demoPose(new THREE.Vector3(side * 0.19, -0.17, -0.25));
   }
 
-  apply(points, closed, armPose = null) {
+  apply(points, closed, armPose = null, palmOrientation = null) {
+    this.points = points;
     this.armPose = armPose;
+    this.palmOrientation = palmOrientation;
     this.previous.copy(this.center);
     this.closed = closed;
     this.center
@@ -120,9 +124,8 @@ export class VirtualHand extends THREE.Group {
     this.line.geometry.attributes.position.needsUpdate = true;
   }
 
-  demoPose(center, closed = 0) {
-    // Lerp between open-hand and fist landmark offsets by `closed` so demo triggers curl
-    // the on-screen skeleton into a fist even when the webcam is off.
+  demoPose(center, closed = 1) {
+    // Explicit closure remains available for pose inspection.
     const t = clamp(closed, 0, 1);
     const yOff = HAND_POSE_OPEN.y.map((v, i) => v * (1 - t) + HAND_POSE_FIST.y[i] * t);
     const zOff = HAND_POSE_OPEN.z.map((v, i) => v * (1 - t) + HAND_POSE_FIST.z[i] * t);
@@ -160,11 +163,16 @@ export class Tracking {
     this.armProfiles = new Map();
     this.guardWidths = [];
     this.results = null;
+    this.resultQueue = [];
     this.stream = null;
     this.worker = null;
     this.busy = false;
     this.pipelineLatency = 0;
     this.frameCallback = null;
+  }
+
+  get currentArmProfiles() {
+    return this.useCapturedArms === false ? EMPTY_ARM_PROFILES : this.armProfiles;
   }
 
   setArmProfile(profile) {
@@ -177,7 +185,7 @@ export class Tracking {
     this.enableBody().catch(() => {});
   }
 
-  async start() {
+  async start(deviceId = '') {
     this.onStatus('Starting local hand tracking…');
     try {
       // Lower capture resolution → smaller HandLandmarker input tensor → faster inference.
@@ -186,6 +194,7 @@ export class Tracking {
       // on busy/frameCallback so we won't process faster than we can, but we get fresher data.
       this.stream = await navigator.mediaDevices.getUserMedia({
         video: {
+          ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
           width: { ideal: 960 },
           height: { ideal: 540 },
           frameRate: { ideal: 60 },
@@ -221,15 +230,21 @@ export class Tracking {
       this.worker.onmessage = ({ data }) => {
         if (data.type === 'poseReady') {
           this.poseReady = true;
+          this.poseSegmentation = !!data.segmentation;
           this.onPoseReady?.();
           return;
         }
         this.busy = false;
         if (data.type === 'result') {
           this.results = data;
+          this.resultQueue.push(data);
+          this.resultQueue = this.resultQueue
+            .filter((frame) => data.timestamp - frame.timestamp <= 250)
+            .slice(-16);
           this.receivedAt = performance.now();
           this.pipelineLatency = this.receivedAt - data.timestamp;
           if (data.capture) this.onCapture?.(data);
+          if (data.armSample) this.onArmSample?.(data);
           this.scheduleFrame();
         } else if (data.type === 'error') {
           this.onStatus(data.message);
@@ -257,11 +272,14 @@ export class Tracking {
     this.worker = null;
     this.busy = false;
     this.results = null;
+    this.resultQueue = [];
     this.poseReady = false;
+    this.poseSegmentation = false;
     this.appliedTimestamp = 0;
     this.calibration = null;
     this.bodyFrame = null;
     this.captureRequest = null;
+    this.scanArms = false;
     this.frameCallback = null;
     this.pipelineLatency = 0;
     this.poseInitReject?.(
@@ -299,11 +317,14 @@ export class Tracking {
             bitmap,
             timestamp: posted,
             capture: this.captureRequest,
-            trackBody: this.armProfiles.size > 0,
+            trackBody: this.currentArmProfiles.size > 0 || this.trackArmView,
+            scanArms: !!this.scanArms && posted - (this.lastArmScanFrame || 0) >= 150,
           },
           [bitmap],
         );
         this.captureRequest = null;
+        if (this.scanArms && posted - (this.lastArmScanFrame || 0) >= 150)
+          this.lastArmScanFrame = posted;
       } catch {
         this.busy = false;
         this.scheduleFrame();
@@ -322,10 +343,10 @@ export class Tracking {
     this.bodyFrame = calibrateBodyFrame(
       pose?.worldLandmarks?.[0],
       pose?.landmarks?.[0],
-      [...this.armProfiles.values()],
+      [...this.currentArmProfiles.values()],
     );
     if (
-      this.armProfiles.size &&
+      this.currentArmProfiles.size &&
       (!this.bodyFrame ||
         !Number.isFinite(pose.timestamp) ||
         this.results.timestamp - pose.timestamp > 180)
@@ -338,16 +359,19 @@ export class Tracking {
         .map((lm) => Math.hypot(lm[5].x - lm[17].x, lm[5].y - lm[17].y))
         .reduce((a, b) => a + b, 0) / hands.length;
     this.onStatus(
-      this.armProfiles.size
+      this.currentArmProfiles.size
         ? 'Personal proportions calibrated · body and palm tracking drive the captured meshes'
         : 'Guard calibrated · close your fist and move across the target',
     );
   }
 
   async enableBody({ wantSegmentation = false } = {}) {
-    if (this.poseReady) return;
+    if (this.poseReady && (!wantSegmentation || this.poseSegmentation)) return;
     if (!this.active) throw new Error('Connect your webcam first.');
-    if (this.poseInitPromise) return this.poseInitPromise;
+    if (this.poseInitPromise) {
+      await this.poseInitPromise;
+      return this.enableBody({ wantSegmentation });
+    }
     this.poseInitPromise = new Promise((resolve, reject) => {
       const timer = setTimeout(
         () => reject(new Error('Body model initialization timed out.')),
@@ -370,7 +394,19 @@ export class Tracking {
     return this.poseInitPromise;
   }
 
-  tick(now, hands) {
+  drainResults(now) {
+    const frames = this.resultQueue.filter(
+      (frame) =>
+        frame.timestamp > (this.appliedTimestamp ?? -Infinity) &&
+        now - frame.timestamp <= 250,
+    );
+    this.resultQueue = [];
+    return frames.length
+      ? frames.sort((a, b) => a.timestamp - b.timestamp)
+      : [this.results];
+  }
+
+  tick(now, hands, results = this.results) {
     if (!this.active) return;
     for (const h of hands) h.updated = false;
     // Ingest is driven by requestVideoFrameCallback in scheduleFrame(); tick() only
@@ -379,7 +415,7 @@ export class Tracking {
     // Only fully hide a hand when tracking has been silent for >1 s. Between-frame gaps of a few
     // hundred ms happen constantly with MediaPipe — flipping visible on/off each of those gaps
     // is what caused the on-screen skeleton to strobe.
-    if (!this.results || now - this.results.timestamp > 1000) {
+    if (!results || now - results.timestamp > 1000) {
       for (const h of hands) {
         h.tracked = false;
         h.visible = false;
@@ -390,18 +426,18 @@ export class Tracking {
     // Retaining the last drawing must not retain contact eligibility. After
     // a gap, reset tracking so reacquisition cannot turn the entire jump
     // between old and new samples into a punch.
-    if (now - this.results.timestamp > 350) {
+    if (now - results.timestamp > 350) {
       for (const h of hands) {
         h.tracked = false;
         h.armPose = null;
       }
       return;
     }
-    if (this.appliedTimestamp === this.results.timestamp) return;
+    if (this.appliedTimestamp === results.timestamp) return;
     const sampleDt = this.appliedTimestamp
-      ? clamp((this.results.timestamp - this.appliedTimestamp) / 1000, 1 / 60, 0.15)
+      ? clamp((results.timestamp - this.appliedTimestamp) / 1000, 1 / 60, 0.15)
       : 1 / 30;
-    this.appliedTimestamp = this.results.timestamp;
+    this.appliedTimestamp = results.timestamp;
     const previouslyTracked = new Map(hands.map((h) => [h.side, h.tracked]));
     // Clear tracked but not visible — the skeleton stays where it was until a fresh hand assignment
     // moves it. Old code cleared visible here too, so a single frame with no detection blanked it.
@@ -409,34 +445,56 @@ export class Tracking {
       h.tracked = false;
       h.armPose = null;
     }
-    const body = this.results.pose,
+    const body = results.pose,
       assignments = matchHandsToBody(
-        this.results.landmarks,
-        body?.landmarks?.[0],
+        results.landmarks,
+        body && results.timestamp - body.timestamp <= 180
+          ? body.landmarks?.[0]
+          : null,
         this.video.videoWidth / this.video.videoHeight || 1,
       );
-    this.results.landmarks.forEach((lm, i) => {
+    // Which arm each detection belongs to. The body pose is the authority when it ran; otherwise
+    // MediaPipe's own label decides. On the unmirrored frames this app sends, tasks-vision 0.10
+    // names the ANATOMICAL hand: "Left" is the user's left, side -1. Measured by running the
+    // bundled landmarker over rendered arms of known chirality — 39 of 43 confident labels named
+    // the anatomy, none of them the legacy selfie convention this used to assume. That assumption
+    // sent every hand to the opposite arm: invisible for the skeleton, which draws at the
+    // landmarks themselves, but it crossed the first-person 3D arms, whose shoulders are pinned
+    // at +-0.21. tests/hand-side.test.mjs holds the coherence check.
+    const sides = results.landmarks.map((lm, i) => {
+      const matched = assignments.get(i);
+      if (matched) return matched === 'left' ? -1 : 1;
+      return results.handedness[i]?.[0]?.categoryName === 'Left' ? -1 : 1;
+    });
+    // Both detections on one arm leaves the other frozen mid-reach. Move the hand the body pose
+    // did not place; with neither placed, image order decides, because an unmirrored frame shows
+    // the user's right hand on the image's left.
+    if (sides.length === 2 && sides[0] === sides[1]) {
+      const loose = [0, 1].filter((i) => !assignments.has(i));
+      if (loose.length === 1) sides[loose[0]] *= -1;
+      else if (loose.length === 2) {
+        const centre = (i) =>
+          (results.landmarks[i][5].x + results.landmarks[i][17].x) / 2;
+        sides[0] = centre(0) < centre(1) ? 1 : -1;
+        sides[1] = -sides[0];
+      }
+    }
+    results.landmarks.forEach((lm, i) => {
       // Mirror horizontal motion into the user's body frame. This creates a
       // virtual view, not recovered RGB of unseen hand surfaces.
       const centerX = (lm[5].x + lm[17].x) / 2;
       const matched = assignments.get(i),
-        side = matched
-          ? matched === 'left'
-            ? -1
-            : 1
-          : this.results.handedness[i]?.[0]?.categoryName === 'Left'
-            ? 1
-            : -1;
+        side = sides[i];
       const h = hands.find((h) => h.side === side);
       if (!h) return;
-      const profile = this.armProfiles.get(side < 0 ? 'left' : 'right');
-      if (this.armProfiles.size && !profile) return;
+      const profile = this.currentArmProfiles.get(side < 0 ? 'left' : 'right');
+      if (this.currentArmProfiles.size && !profile) return;
       if (profile) {
         if (
           !matched ||
           !body ||
           !Number.isFinite(body.timestamp) ||
-          this.results.timestamp - body.timestamp > 180
+          results.timestamp - body.timestamp > 180
         )
           return;
         const pose = retargetCapturedArm(
@@ -444,12 +502,13 @@ export class Tracking {
           this.bodyFrame,
           body.worldLandmarks?.[0],
           body.landmarks?.[0],
-          this.results.worldLandmarks?.[i],
+          results.worldLandmarks?.[i],
         );
         if (!pose) return;
         h.visible = true;
         h.tracked = true;
-        h.apply(pose.joints.slice(3), fistScore(lm), pose);
+        const points = pose.joints.slice(3);
+        h.apply(points, fistScore(lm), pose, palmFrame(points, side));
         h.sampleDt = sampleDt;
         h.updated = previouslyTracked.get(h.side) === true;
         if (!h.updated) h.previous.copy(h.center);
@@ -478,7 +537,17 @@ export class Tracking {
       );
       h.visible = true;
       h.tracked = true;
-      h.apply(points, fistScore(lm));
+      h.apply(
+        points,
+        fistScore(lm),
+        null,
+        trackedPalmFrame(
+          results.worldLandmarks?.[i],
+          lm,
+          side,
+          this.video.videoWidth / this.video.videoHeight || 1,
+        ),
+      );
       h.sampleDt = sampleDt;
       h.updated = previouslyTracked.get(h.side) === true;
       if (!h.updated) h.previous.copy(h.center);

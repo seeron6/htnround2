@@ -8,11 +8,12 @@ bodies are never attached; only names, durations, counts and status.
 
 from contextlib import contextmanager
 from pathlib import Path
-import json, os
+import json, os, threading, time
 
 ROOT = Path(__file__).resolve().parent
 ENABLED = False
 SERVICE = 'punching-face'
+_job = threading.local()
 try:
     import sentry_sdk
 except Exception:
@@ -38,23 +39,63 @@ def _dsn():
     )
 
 
+def release():
+    """`punching-face@<commit>`, shared by the browser and every service, so Sentry can compare a
+    number before and after a fix. SENTRY_RELEASE (or "release" in sentry.json) overrides it.
+    """
+    saved = {}
+    try:
+        saved = json.loads((ROOT / '.local/secrets/sentry.json').read_text())
+    except (OSError, ValueError):
+        pass
+    named = os.environ.get('SENTRY_RELEASE') or saved.get('release')
+    if named:
+        return str(named)[:80]
+    try:
+        head = (ROOT / '.git/HEAD').read_text().strip()
+        if head.startswith('ref:'):
+            ref = head[4:].strip()
+            try:
+                head = (ROOT / '.git' / ref).read_text().strip()
+            except OSError:
+                packed = (ROOT / '.git/packed-refs').read_text().splitlines()
+                head = next(
+                    (line.split()[0] for line in packed if line.endswith(' ' + ref)), ''
+                )
+        return 'punching-face@' + head[:12] if head else None
+    except OSError:
+        return None
+
+
+# Asked every few seconds while a build runs. The build itself is traced in full (the pipeline's
+# stages, a Meshy job's stages); a thin sample of the asking is enough to see if a poll is slow.
+POLLED = ('/api/meshy-job', '/api/face-status', '/api/arm-status', '/api/meshy-status')
+
+
 def _sampler(context):
     # /physics/step runs at 30 Hz. Keep a thin sample so its latency stays visible without
-    # drowning the quota or adding per-frame overhead; everything else is rare and kept.
+    # drowning the quota or adding per-frame overhead; polls are thinned too; every action a
+    # person took is rare and kept.
     name = (context.get('transaction_context') or {}).get('name', '')
-    return 0.02 if 'physics/step' in name else 1.0
+    if 'physics/step' in name:
+        return 0.02
+    return 0.05 if any(route in name for route in POLLED) else 1.0
 
 
 def init(service, transport=None):
     """Call once per process. `transport` lets tests capture envelopes without a network."""
     global ENABLED, SERVICE
     SERVICE = service
+    if os.environ.get('SENTRY_DISABLED') == '1':
+        ENABLED = False
+        return False
     dsn, environment = _dsn()
     if not sentry_sdk or not (dsn or transport):
         return False
     options = dict(
         dsn=dsn or 'https://public@o0.ingest.sentry.io/0',
         environment=environment,
+        release=release(),
         traces_sampler=_sampler,
         send_default_pii=False,
         max_request_body_size='never',
@@ -93,6 +134,53 @@ def log(message, **attributes):
         sentry_logs.info(message, attributes={'service': SERVICE, **attributes})
 
 
+def warn(message, **attributes):
+    """Something a person should look at, that is not an exception: a fallback, a retry, a refusal."""
+    print(message, flush=True)
+    if ENABLED and sentry_logs:
+        sentry_logs.warning(message, attributes={'service': SERVICE, **attributes})
+
+
+def metric(name, value, unit=None, **attributes):
+    """A distribution in Sentry's trace-connected metrics: p50/p95 over time, split by attribute.
+    For numbers that are asked about in aggregate (first-token latency by voice engine), where a
+    span attribute only answers for one trace at a time."""
+    if not ENABLED or value is None:
+        return
+    try:
+        from sentry_sdk import metrics
+
+        metrics.distribution(
+            name,
+            float(value),
+            unit=unit,
+            attributes={
+                'service': SERVICE,
+                **{k: v for k, v in attributes.items() if v is not None},
+            },
+        )
+    except Exception:
+        pass  # an older sentry-sdk without metrics: the span attributes still carry the number
+
+
+def count(name, **attributes):
+    if not ENABLED:
+        return
+    try:
+        from sentry_sdk import metrics
+
+        metrics.count(
+            name,
+            1,
+            attributes={
+                'service': SERVICE,
+                **{k: v for k, v in attributes.items() if v is not None},
+            },
+        )
+    except Exception:
+        pass
+
+
 def instrument_http(handler):
     """Wrap a BaseHTTPRequestHandler so each request continues the browser's trace. The service name
     comes from init(): one process, one service tag."""
@@ -102,7 +190,13 @@ def instrument_http(handler):
 
     def send_response(self, code, message=None):
         self._sentry_status = code
-        return send(self, code, message)
+        result = send(self, code, message)
+        # Every answer names its trace, so a slow or failed call seen in the browser's network tab
+        # (or in curl) is one search away in Sentry. Also how sentry_doctor.py sees Sentry is on.
+        trace_id = getattr(self, '_sentry_trace_id', None)
+        if trace_id:
+            self.send_header('X-Sentry-Trace-Id', trace_id)
+        return result
 
     handler.send_response = send_response
     for method in ('do_GET', 'do_POST'):
@@ -120,14 +214,98 @@ def instrument_http(handler):
                     source='route',
                 )
                 with sentry_sdk.start_transaction(transaction) as active:
+                    self._sentry_trace_id = getattr(active, 'trace_id', None)
                     try:
                         return original(self)
                     finally:
                         status = getattr(self, '_sentry_status', None)
                         if status:
                             active.set_http_status(status)
+                        if status and status >= 500:
+                            # These handlers answer a crash with a sentence and a 500 and swallow
+                            # the exception. The issue this opens is tied to the trace, and through
+                            # the browser's own report of the 500, to the replay of what led to it.
+                            sentry_sdk.capture_message(
+                                '%s answered %d' % (active.name, status), level='error'
+                            )
 
         setattr(handler, method, wrapped)
+
+
+def traced(target, name, op='job', **tags):
+    """Wrap a thread target so a background job is its own transaction in the trace of the request
+    that started it. The request's transaction ends with its response, long before a cloud build
+    does, so spans started later in the thread would otherwise be dropped with it."""
+    if not ENABLED:
+        return target
+    headers = {
+        'sentry-trace': sentry_sdk.get_traceparent() or '',
+        'baggage': sentry_sdk.get_baggage() or '',
+    }
+
+    def run(*args, **kwargs):
+        with sentry_sdk.isolation_scope():
+            transaction = sentry_sdk.continue_trace(
+                headers, op=op, name=name, source='task'
+            )
+            with sentry_sdk.start_transaction(transaction) as active:
+                for key, value in tags.items():
+                    if value is not None:
+                        active.set_tag(key, str(value)[:100])
+                _job.transaction, _job.span, _job.stage = active, None, None
+                try:
+                    result = target(*args, **kwargs)
+                    if (
+                        not active.status
+                    ):  # job_state() marks a failure; silence means it worked
+                        active.set_status('ok')
+                    return result
+                except BaseException:
+                    active.set_status('internal_error')
+                    raise
+                finally:
+                    _close_job_stage()
+                    _job.transaction = None
+                    sentry_sdk.flush(timeout=4)
+
+    return run
+
+
+def _close_job_stage(status='ok'):
+    span = getattr(_job, 'span', None)
+    if span:
+        span.set_status(status)
+        span.finish()
+    _job.span = _job.stage = None
+
+
+def job_state(state):
+    """Call on every state change of a job running under traced(). A new `stage` closes the last
+    span and opens the next, so the waterfall reads prepare -> upload -> queued -> generating ->
+    download. `status: failed` marks the stage and the job failed and says why in a log.
+    """
+    if not ENABLED or not getattr(_job, 'transaction', None):
+        return
+    stage, status = state.get('stage'), state.get('status')
+    failed = status == 'failed'
+    if failed:
+        _close_job_stage('internal_error')
+        _job.transaction.set_status('internal_error')
+        warn(
+            'job failed',
+            job=_job.transaction.name,
+            reason=str(state.get('message'))[:200],
+        )
+    elif stage and stage != getattr(_job, 'stage', None):
+        _close_job_stage()
+        if status != 'complete':
+            _job.span = sentry_sdk.start_span(op='job.stage', name=str(stage))
+            _job.stage = stage
+        log('job stage: ' + str(stage), job=_job.transaction.name, stage=str(stage))
+    span = getattr(_job, 'span', None)
+    for key in ('progress', 'consumedCredits', 'seconds', 'aiModel', 'resumable'):
+        if state.get(key) is not None:
+            (span or _job.transaction).set_data('job.' + key, state[key])
 
 
 def child_env():
@@ -250,7 +428,55 @@ def _cost_usd(model, usage):
 
 
 @contextmanager
-def ai_span(model, system, **shape):
+def agent_span(agent, model=None, conversation=None, **data):
+    """One whole turn of an agent. Sentry's AI Agents view groups what happens inside it: the
+    model calls (ai_span), the tool calls (tool_span) and the voice. `data` is non-PII only.
+    """
+    if not ENABLED:
+        yield None
+        return
+    with sentry_sdk.start_span(
+        op='gen_ai.invoke_agent', name='invoke_agent ' + agent
+    ) as span:
+        span.set_data('gen_ai.operation.name', 'invoke_agent')
+        span.set_data('gen_ai.agent.name', agent)
+        if model:
+            span.set_data('gen_ai.request.model', model)
+        if conversation:
+            span.set_data('gen_ai.conversation.id', str(conversation)[:64])
+        for key, value in data.items():
+            if value is not None:
+                span.set_data('agent.' + key, value)
+        yield span
+
+
+def _start(parent, **span):
+    """A child of `parent` when given one (work in another thread, which should still sit beside
+    its siblings in the waterfall), else of whatever span is active here."""
+    return parent.start_child(**span) if parent else sentry_sdk.start_span(**span)
+
+
+@contextmanager
+def tool_span(tool, agent=None, parent=None, **data):
+    """A function the model called (the face's set_expression). Arguments are recorded only
+    when they are from a closed vocabulary, never free text."""
+    if not ENABLED:
+        yield None
+        return
+    with _start(parent, op='gen_ai.execute_tool', name='execute_tool ' + tool) as span:
+        span.set_data('gen_ai.operation.name', 'execute_tool')
+        span.set_data('gen_ai.tool.name', tool)
+        span.set_data('gen_ai.tool.type', 'function')
+        if agent:
+            span.set_data('gen_ai.agent.name', agent)
+        for key, value in data.items():
+            if value is not None:
+                span.set_data('tool.' + key, value)
+        yield span
+
+
+@contextmanager
+def ai_span(model, system, agent=None, parent=None, **shape):
     """Shaped for Sentry's AI agent monitoring (gen_ai.* attributes).
 
     `shape` accepts non-PII request descriptors: messages_count, system_prompt_len,
@@ -260,10 +486,14 @@ def ai_span(model, system, **shape):
     if not ENABLED:
         yield None
         return
-    with sentry_sdk.start_span(op='gen_ai.chat', name='chat ' + model) as span:
+    with _start(parent, op='gen_ai.chat', name='chat ' + model) as span:
         span.set_data('gen_ai.operation.name', 'chat')
         span.set_data('gen_ai.system', system)
+        span.set_data('gen_ai.provider.name', system)
         span.set_data('gen_ai.request.model', model)
+        span.set_data('gen_ai.response.streaming', True)
+        if agent:
+            span.set_data('gen_ai.agent.name', agent)
         for key, value in shape.items():
             if value is None:
                 continue
@@ -285,9 +515,28 @@ def ai_usage(span, usage, first_token_ms, frames, finish_reason=None, model=None
     cost = _cost_usd(model, usage)
     if cost is not None:
         span.set_data('gen_ai.usage.cost_usd', cost)
+        # The names Sentry's AI views total up. This gateway's model is not in Sentry's own price
+        # list, so without these the cost column would stay empty.
+        prices = AI_PRICES[(model or '').lower()]
+        span.set_data('gen_ai.cost.total_tokens', cost)
+        span.set_data(
+            'gen_ai.cost.input_tokens',
+            round((usage.get('prompt_tokens') or 0) * prices[0] / 1e6, 6),
+        )
+        span.set_data(
+            'gen_ai.cost.output_tokens',
+            round((usage.get('completion_tokens') or 0) * prices[1] / 1e6, 6),
+        )
     if finish_reason:
         span.set_data('gen_ai.response.finish_reason', str(finish_reason)[:40])
+        span.set_data('gen_ai.response.finish_reasons', str(finish_reason)[:40])
+    if model:
+        span.set_data('gen_ai.response.model', model)
     span.set_data('gen_ai.response.first_token_ms', first_token_ms)
+    if first_token_ms is not None:
+        span.set_data(
+            'gen_ai.response.time_to_first_token', round(first_token_ms / 1000, 4)
+        )
     span.set_data('gen_ai.request.frames_attached', frames)
 
 

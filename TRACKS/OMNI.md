@@ -2,6 +2,23 @@
 
 Source of truth for the OMNI Live integration. Anyone touching the OMNI engine reads this first.
 
+> **What is actually live (checked in the running app, 2026-09-19 late).** The demo path is the **Face panel**:
+> `src/sponsors/cornerman.js` → `sponsor_server.py` (+ `omni_senses.py`) → `qwen3.5-omni-flash` over streamed
+> chat-completions. Per turn it sends a 6-frame **video**, the person's **voice** or 2.5 s of **room sound**, and the
+> measured punch numbers; it gets back streamed **speech** in a chosen OMNI voice and, from a parallel function call,
+> the **expression** the head wears. Cached grunts in the same voice answer a punch in < 50 ms.
+> [OMNI_JUDGES.md](OMNI_JUDGES.md) has the rubric map and the measurements; [../DEMO.md](../DEMO.md) the script;
+> `scripts/omni_preflight.py` re-checks all of it against the live model.
+>
+> The **Realtime engine below (Plan A) is not part of the demo.** `omni_relay.py` and `src/omni/session.js` work
+> against the gateway, but `src/scenarios/arena/engine-wire.js` never starts `FrameCapture` / `AudioCapture`, never
+> plays `audio.delta`, and its tool handlers only log. `?arena_omni=1` therefore spends credits and shows nothing: do
+> not use it on stage. Finishing it is the next step after the event, not a switch to flip.
+>
+> **Per-machine traps:** the usage ledger only records where the sponsor's `yibuapi_examples` package is extracted
+> under `.local/third_party/` (on Seeron's laptop it was **not**, so calls made there were not recorded); and the key
+> lives in `.local/secrets/omni.json`, which git never carries between laptops.
+
 ---
 
 ## Build status (last updated: 2026-09-19, key live)
@@ -163,7 +180,13 @@ Before submitting, run `npm run omni:report`, inspect the outputs, and reply to 
 
 ## 7. Privacy and safety
 
-- **Scan consent gate:** subject faces the camera and says a consent phrase; OMNI verifies face and phrase before scanning proceeds. One 30-second gate before any capture is stored.
+- **Scan consent gate: designed, NOT built.** The idea: the subject faces the camera and says a consent phrase, and
+  OMNI verifies the face and the phrase together before a scan is stored. Nothing in the code does this yet; do not
+  claim it. Today the safeguards are: scans stay on the laptop, and the persona (see `FACE` in `sponsor_server.py`).
+- **Safety beats the act (built, measured):** a spoken "stop, I feel dizzy" drops the persona at once, with a
+  `concerned` expression. The persona never mocks who someone is and refuses anything aimed at a real person.
+- **What leaves the device is shown live** in the panel badge, and changes when *Let it see me* / *Let it hear the
+  room* are unticked.
 - **Key custody:** the API key lives in `.env` or `.local/secrets/omni.json` (mode 0600) and never leaves the relay process. The browser never sees the key.
 - **Session-scoped data:** meshes and any cloned voice are deleted when the tab closes. Only downscaled frames and audio ever leave the machine, and only while the route is active.
 

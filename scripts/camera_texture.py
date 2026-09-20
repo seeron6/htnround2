@@ -1,7 +1,7 @@
 """Conservative surface smoothing of low-frequency camera ownership.
 
 Captured RGB, high-frequency detail and physical-support/fallback scores stay
-separate. A second projection visits only texels whose ownership changed.
+separate. Ownership reuses the accepted first-pass colors and support exactly.
 """
 
 import numpy as np
@@ -34,17 +34,24 @@ class CameraTexture:
         self.slots[self.ids] = np.arange(len(self.ids))
         self.views = {view.name: index for index, view in enumerate(views)}
         self.weights = np.zeros((len(self.ids), len(views)))
+        self.colors = {}
         self.domain = lower_lateral_region(vertices, vertices, labels) > 0
 
-    def observe(self, view, near, weight):
+    def observe(self, view, near, weight, accum):
         slots = self.slots[near]
         valid = slots >= 0
         self.weights[slots[valid], self.views[view.name]] = weight[valid]
+        # Retain only accepted regional samples, not whole projected images.
+        # Re-projecting a subset can round a boundary sample differently and
+        # reject a camera that was valid in pass one. Its exact accepted color
+        # is also cheaper to retain than to repeat all source masks and warps.
+        accepted = valid & (weight > 0)
+        self.colors[view.name] = (
+            slots[accepted],
+            accum[accepted] / weight[accepted, None],
+        )
 
-    def reblend(
-        self, views, project, workers, confidence, cleanup, hair, hair_total, hair_best
-    ):
-        from concurrent.futures import ThreadPoolExecutor
+    def reblend(self, views, confidence, cleanup, hair, hair_total, hair_best):
         from scripts.camera_ownership import (
             fit_camera_ownership_delta,
             apply_camera_ownership_delta,
@@ -95,6 +102,7 @@ class CameraTexture:
             'limitation': 'Local view blending, not recovered skin albedo or illumination.',
         }
         if len(sampled) < 32:
+            self.colors.clear()
             return np.empty(0, dtype=int), np.empty((0, 3)), audit
 
         def subset(selected):
@@ -130,28 +138,18 @@ class CameraTexture:
         selected = ids[changed]
         probabilities = revised[changed]
         if not len(selected):
+            self.colors.clear()
             return selected, np.empty((0, 3)), audit
-        # The projector's original alpha, depth, ownership and source masks
-        # are evaluated again. No camera rejected in pass one receives weight.
+        # Only the weights change. Reuse the colors accepted by the original
+        # alpha/depth/ownership/source masks; no rejected camera gains support.
         result = np.zeros((len(selected), 3))
-        with ThreadPoolExecutor(workers, thread_name_prefix='photo-ownership') as pool:
-            for start in range(0, len(views), workers):
-                batch = views[start : start + workers]
-                outputs = pool.map(lambda view: project(view, selected), batch)
-                for view, projected in zip(batch, outputs):
-                    near, contributions = projected[:2]
-                    weight = contributions['total']
-                    rgb = np.divide(
-                        contributions['accum'],
-                        weight[:, None],
-                        out=np.zeros_like(contributions['accum']),
-                        where=weight[:, None] > 0,
-                    )
-                    slot = np.searchsorted(selected, near)
-                    revised_weight = probabilities[slot, self.views[view.name]]
-                    if np.any((revised_weight > 0) & (weight <= 0)):
-                        raise ValueError(
-                            'Camera ownership revived a rejected projection.'
-                        )
-                    result[slot] += rgb * revised_weight[:, None]
+        output_slots = np.full(len(ids), -1, dtype=np.int32)
+        output_slots[changed] = np.arange(len(selected))
+        for view in views:
+            slots, rgb = self.colors.pop(view.name)
+            take = changed[slots]
+            output = output_slots[slots[take]]
+            revised_weight = probabilities[output, self.views[view.name]]
+            result[output] += rgb[take] * revised_weight[:, None]
+        audit['projectionPasses'] = 1
         return selected, result, audit

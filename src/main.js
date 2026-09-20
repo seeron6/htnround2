@@ -1,7 +1,9 @@
 import { installDemoFlow } from './demo-flow.js';
 import { loadMeshyModel } from './meshy-engine.js';
 import { startMeshyPhoto, loadReadyMeshyPhoto } from './meshy-photo.js';
+import { requestHeadName, nameFromFile } from './head-name.js';
 import { loadHeadBundle } from './head-bundle.js';
+import { requireCompleteHead } from './head-completeness.js';
 import { installRealismControls } from './realism-controls.js';
 import { installImpactControls } from './impact-controls.js';
 import { DEFAULT_SOFTNESS } from './tissue-field.js';
@@ -12,19 +14,37 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import { importedHeadGeometry } from './imported-head.js';
 import { NewtonFaceDynamics } from './newton-dynamics.js';
-import { FaceDynamics, clamp, sweptEllipsoid } from './physics.js';
+import { FaceDynamics, clamp } from './physics.js';
 import { ImpactReferences } from './impact-references.js';
 import { ArmCapture } from './arm-capture.js';
 import { FaceCapture } from './face-capture.js';
 import { ScannedArm } from './scanned-arm.js';
 import { HeadGlasses } from './head-accessories.js';
 import { HeadHair, remapHairRoots } from './head-hair.js';
+import { HeadHairSurface } from './head-hair-surface.js';
 import { SurfaceAppearance, weldTexturedSurface } from './surface-appearance.js';
 import { refineSurface } from './surface.js';
 import { openMouthAperture, MouthCavity } from './mouth-aperture.js';
+import { MouthInterior } from './mouth-interior.js';
 import { detectFaceOnMesh, lastDetectorRender } from './lip-detect.js';
-import { VirtualHand, Tracking, makePhotoFace, cropFacePortrait } from './hands.js';
-import { SlapDetector, DEFAULT_TUNING } from './slap-detect.js';
+import {
+  planLipCut,
+  lipTopologyOf,
+  clearLegacyMouthShading,
+  lipOpening,
+  growBinding,
+  growVertexField,
+  detectionFromCage,
+  trustedDetection,
+  soundAnchors,
+  shadeMouth,
+} from './lip-fit.js';
+import { VirtualHand, Tracking, cropFacePortrait } from './hands.js';
+import { WebcamPunching } from './punch-mapping.js';
+import { cameraFists, renderedFists } from './screen-contact.js';
+import { installPunchHud } from './punch-hud.js';
+import { LiveArms } from './live-arms.js';
+import { QuickArms } from './quick-arms.js';
 import './style.css';
 
 const $ = (id) => document.getElementById(id);
@@ -89,9 +109,14 @@ document.querySelector('#app').innerHTML = /* HTML */ ` <header>
         <button id="calibrate" class="full small" disabled>
           Calibrate guard position</button
         ><button id="scan-arms" class="full small" style="margin-top:7px">
-          Scan my arms
+          Scan / customize my arms
         </button>
-        <p id="arm-appearance" class="muted">Personal arm meshes: awaiting capture.</p>
+        <p id="arm-appearance" class="muted">
+          Choose skeleton, live CV, or first-person 3D arms.
+        </p>
+        <label class="check"
+          >Mirrored camera feed <input id="punch-mirrored" type="checkbox"
+        /></label>
         <label class="check"
           >Demo hand shapes <input id="demo-hands" type="checkbox"
         /></label>
@@ -188,18 +213,18 @@ document.querySelector('#app').innerHTML = /* HTML */ ` <header>
               <div id="slap-growth-fill"></div>
               <div id="slap-growth-mark" class="slap-threshold"></div>
             </div>
-            <span id="slap-growth-val" class="slap-value">0.0/s</span>
+            <span id="slap-growth-val" class="slap-value">0.0 m/s</span>
           </div>
           <div class="slap-metric">
-            <span class="slap-label">Rise</span>
+            <span class="slap-label">Reach</span>
             <div class="slap-bar slap-bar-signed">
               <div id="slap-vy-fill"></div>
               <div id="slap-vy-mark" class="slap-threshold"></div>
             </div>
-            <span id="slap-vy-val" class="slap-value">0.0/s</span>
+            <span id="slap-vy-val" class="slap-value">0 cm</span>
           </div>
           <div class="slap-metric">
-            <span class="slap-label">Palm size</span>
+            <span class="slap-label">Hand size</span>
             <div class="slap-bar">
               <div id="slap-width-fill"></div>
               <div id="slap-width-mark" class="slap-threshold"></div>
@@ -227,7 +252,7 @@ document.querySelector('#app').innerHTML = /* HTML */ ` <header>
         <div class="bottom-line">
           <span id="view-label">FIRST-PERSON · VIRTUAL HANDS</span
           ><span id="slap-status-line"
-            >Connect webcam · palm toward camera = punch</span
+            >Connect webcam · aim your punch at the head</span
           >
         </div>
       </div>
@@ -445,15 +470,15 @@ document.querySelector('#app').innerHTML = /* HTML */ ` <header>
     <h1>Capture a face. Then a room.</h1>
     <div class="capture-grid">
       <div class="capture-card">
-        <h2>Try your face now</h2>
+        <h2>Create your whole head</h2>
         <p class="muted">
-          A frontal image becomes a textured landmark mesh. Fast likeness preview;
-          estimated depth and no back of head. Use Record for multiview geometry.
+          Record or import overlapping views of your face, both sides, crown and back.
+          Every reconstruction includes a complete head; unseen regions are estimated.
         </p>
-        <button id="snapshot" class="full primary">Use webcam portrait</button
+        <button id="snapshot" class="full primary">Scan with webcam</button
         ><button id="photo-import" class="full small" style="margin-top:9px">
-          ↑ Choose a face photo</button
-        ><input id="photo-file" type="file" accept="image/*" />
+          ↑ Import head photographs</button
+        ><input id="photo-file" type="file" accept="image/png,image/jpeg" multiple />
       </div>
       <div class="capture-card">
         <h2>Scan for fidelity</h2>
@@ -488,8 +513,9 @@ document.querySelector('#app').innerHTML = /* HTML */ ` <header>
         capture is needed to preserve unseen features.
       </li>
       <li>
-        Press Create 3D face. Inspect Geometry and Wireframe to check depth. Gray areas
-        mark estimated, unseen head surfaces.
+        Your full head builds automatically after capture or import. Inspect the face,
+        both profiles, crown and back. Unphotographed detail is labeled as estimated in
+        Reconstruction evidence.
       </li>
       <li>
         Import a 360° room panorama for the surrounding view. A panorama supplies
@@ -497,10 +523,11 @@ document.querySelector('#app').innerHTML = /* HTML */ ` <header>
       </li>
     </ol>
     <p class="note">
-      Your laptop camera drives virtual hand articulation. A room scan supplies novel
-      background views; it cannot reveal your hands’ hidden surfaces. Capture each arm
-      separately to reconstruct its appearance. Monocular depth and automatic rigging
-      remain estimates.
+      Choose Live CV arms in the Camera panel to see your own hands and sleeves. A
+      separate body camera supplies a first-person view; open the camera setup guide
+      beside the controls. Live arm cutouts show the surfaces visible to that camera.
+      Scan / customize my arms fits first-person presets in an eight-second capture.
+      Multiview arm reconstruction remains available in that panel's advanced section.
     </p>
     <div id="capture-result" class="muted" role="status"></div>
   </dialog>`;
@@ -581,7 +608,9 @@ const demoQueue = [];
 let surfaceAppearance = null,
   headGlasses = null,
   headHair = null,
-  mouthCavity = null;
+  headHairCap = null,
+  mouthCavity = null,
+  mouthInterior = null;
 let meshMatchesSource = true,
   impactHeld = false,
   watchPeak = false,
@@ -591,9 +620,50 @@ const screen = new THREE.Vector2();
 const tracking = new Tracking($('webcam'), (message) => {
   $('tracking-status').textContent = message;
 });
-const slapDetector = new SlapDetector();
-let lastSlapResultTs = 0,
-  lastSlapEvent = null;
+const webcamPunching = new WebcamPunching({
+  video: $('webcam'),
+  getMesh: () => mesh,
+  getDynamics: () => dynamics,
+  getView: (results) => {
+    const viewport = { width: $('stage').clientWidth, height: $('stage').clientHeight };
+    const display = liveArms.display;
+    const body = display === 'live' && liveArms.source === 'body';
+    const input = body ? liveArms.contactResults : results;
+    const video = body ? liveArms.video : tracking.video;
+    const mirrored = body
+      ? liveArms.$('body-camera-mirror').checked
+      : !$('punch-mirrored').checked;
+    return {
+      camera,
+      viewport,
+      timestamp: input?.timestamp,
+      key: `${display}:${liveArms.source}:${mirrored}`,
+      samples:
+        display === 'live'
+          ? cameraFists(
+              input,
+              { width: video.videoWidth || 640, height: video.videoHeight || 480 },
+              viewport,
+              mirrored,
+            )
+          : renderedFists(
+              hands,
+              camera,
+              viewport,
+              input?.timestamp,
+              display === 'preset' ? quickArms.arms : [],
+            ),
+    };
+  },
+  contact,
+});
+const updatePunchHud = installPunchHud(webcamPunching);
+const liveArms = new LiveArms({
+  tracking,
+  stage: $('stage'),
+  mirrored: () => !$('punch-mirrored').checked,
+});
+for (const hand of hands) hand.line.visible = false;
 const referenceLibrary = new ImpactReferences();
 $('impact-references').onclick = () => referenceLibrary.open();
 const scannedArms = new Map();
@@ -601,13 +671,41 @@ const armCapture = new ArmCapture(tracking, async (bundle) => {
   const arm = new ScannedArm(bundle);
   scannedArms.get(bundle.side)?.dispose();
   scannedArms.set(bundle.side, arm);
+  liveArms.setDisplay('captured');
   scene.add(arm);
   tracking.setArmProfile(arm.profile);
   $('arm-appearance').textContent =
     `Captured meshes: ${[...scannedArms.keys()].join(' + ')}. Auto rig; inspect joints in motion.`;
   toast(`${bundle.side} arm loaded from reconstructed capture.`);
 });
-$('scan-arms').onclick = () => armCapture.open();
+const quickArms = new QuickArms({
+  tracking,
+  camera,
+  scene,
+  getMode: () => liveArms.display,
+  setMode: (mode) => liveArms.setDisplay(mode),
+  onChange: () => {
+    $('arm-appearance').textContent =
+      'Your first-person arms are ready. Scan again or edit the presets any time.';
+  },
+});
+quickArms.$('advanced').onclick = () => {
+  quickArms.close();
+  armCapture.open();
+};
+$('scan-arms').onclick = () => void quickArms.open();
+let armScanOffered = false;
+window.addEventListener('punching-face-arm-mode', ({ detail }) => {
+  tracking.useCapturedArms = detail === 'captured';
+  if (detail !== 'preset') return;
+  firstPerson();
+  // "My 3D arms" is a request to be scanned, so the fit opens with the mode. Kept arms, an open
+  // dialog, and a session where it was already offered all leave it alone — switching modes back
+  // and forth must not reopen it, and the Camera panel button reopens it on demand.
+  if (armScanOffered || quickArms.scanned || quickArms.isOpen) return;
+  armScanOffered = true;
+  void quickArms.open();
+});
 const trace = new Array(150).fill(0);
 const busy = (active, message) => {
   $('busy').classList.toggle('active', active);
@@ -699,8 +797,17 @@ const hairFields = {
 
 function installHair(spec) {
   headHair?.dispose();
+  headHairCap?.dispose();
   headHair = spec ? new HeadHair(mesh.geometry, spec) : null;
-  if (headHair) headPivot.add(headHair);
+  headHairCap =
+    spec?.cap?.enabled && spec
+      ? new HeadHairSurface(mesh.geometry, { ...spec.cap, hairlineY: spec.hairlineY })
+      : null;
+  if (headHair) {
+    headHair.renderOrder = 2;
+    headPivot.add(headHair);
+  }
+  if (headHairCap) headPivot.add(headHairCap);
   for (const id of ['hair-visible', 'hair-type', ...Object.keys(hairFields)])
     $(id).disabled = !headHair;
   $('hair-visible').checked = !!headHair;
@@ -724,12 +831,16 @@ function restoreAccessoryVisibility(accessories) {
   }
   if (headHair) {
     headHair.visible = accessories?.visibility?.hair ?? true;
+    if (headHairCap) headHairCap.visible = headHair.visible;
     $('hair-visible').checked = headHair.visible;
   }
 }
 
 $('hair-visible').onchange = () => {
-  if (headHair) headHair.visible = $('hair-visible').checked;
+  if (headHair) {
+    headHair.visible = $('hair-visible').checked;
+    if (headHairCap) headHairCap.visible = headHair.visible;
+  }
 };
 for (const [id, key] of Object.entries(hairFields))
   $(id).onchange = () => {
@@ -755,12 +866,15 @@ $('hair-type').onchange = () => {
   }
 };
 
-function installMesh(g, material, meta = {}) {
+function installMesh(g, material, meta = {}, { deferMouth = false } = {}) {
+  requireCompleteHead(meta.stats ?? meta);
   realismControls?.reset();
   installGlasses(null);
   installHair(null);
   mouthCavity?.dispose();
   mouthCavity = null;
+  mouthInterior?.dispose();
+  mouthInterior = null;
   // Cut the mouth open BEFORE refineSurface: the canonical face seals it with 18
   // exactly-known triangles and subdividing turns those into 288 anonymous ones.
   const aperture = openMouthAperture(g, null);
@@ -891,7 +1005,9 @@ function installMesh(g, material, meta = {}) {
     $(name).value = 0;
     if ($(name + '-value')) $(name + '-value').textContent = '0%';
   }
-  fitMouth();
+  // The caller may still be attaching a textured surface or a solver: this fit
+  // waits for the load to settle, and gives way to any fit the caller asks for.
+  if (!deferMouth) fitMouth(false, undefined, { settle: true });
   setView('mesh');
   revision++;
   peak = 0;
@@ -938,7 +1054,8 @@ function firstPerson() {
 }
 
 function contact(point, direction, speed, source, mode = 'hook', options = {}) {
-  if (!dynamics || demoFlow?.isOpen || demoFlow?.canPunch === false) return false;
+  if (!dynamics || demoFlow?.isOpen || quickArms.isOpen || demoFlow?.canPunch === false)
+    return false;
   impactHeld = false;
   watchPeak = true;
   previousDisplacement = 0;
@@ -969,6 +1086,7 @@ function contact(point, direction, speed, source, mode = 'hook', options = {}) {
     source,
     magnitude: options.magnitude ?? Math.min(0.9, speed / 1.4),
     mode,
+    cv: options.cv ?? null,
     side: options.side ?? (point.x < 0 ? 'left' : 'right'),
     time: performance.now(),
   };
@@ -978,118 +1096,31 @@ function contact(point, direction, speed, source, mode = 'hook', options = {}) {
   return true;
 }
 
-function checkContact(hand, dt, now, source, mode = 'hook') {
-  if (!mesh || !hand.visible || now - hand.lastHit < 0.12) return;
-  // Fist gate removed: rely on the swept-ellipsoid + raycast narrow phase to reject
-  // any motion that isn't actually driving the hand into the face. Motion blur during
-  // a real punch often mis-classifies as an open hand, so the classifier was a false gate.
-  const velocity = hand.center
-    .clone()
-    .sub(hand.previous)
-    .divideScalar(Math.max(dt, 1 / 120));
-  const speed = velocity.length();
-  if (speed < 0.35) return;
-  headPivot.updateWorldMatrix(true, false);
-  const from = headPivot.worldToLocal(hand.previous.clone()),
-    to = headPivot.worldToLocal(hand.center.clone());
-  mesh.geometry.computeBoundingBox();
-  const bounds = mesh.geometry.boundingBox;
-  const center = bounds.getCenter(new THREE.Vector3()),
-    radii = bounds.getSize(new THREE.Vector3()).multiplyScalar(0.5);
-  if (
-    sweptEllipsoid(
-      from.toArray(),
-      to.toArray(),
-      center.toArray(),
-      radii.toArray(),
-      0.037,
-    ) === null
-  )
-    return;
-  // Narrow phase samples the real mesh along the motion and radial probe rays.
-  // This is a small swept-sphere approximation, not a medical contact solver.
-  const travel = to.clone().sub(from),
-    length = travel.length(),
-    dir = travel.clone().normalize();
-  let hit = null;
-  for (const offset of [
-    [0, 0, 0],
-    [0.026, 0, 0],
-    [-0.026, 0, 0],
-    [0, 0.026, 0],
-    [0, -0.026, 0],
-  ]) {
-    const start = from.clone().add(new THREE.Vector3(...offset));
-    const worldStart = headPivot.localToWorld(start);
-    const worldDir = dir.clone().transformDirection(headPivot.matrixWorld);
-    raycaster.set(worldStart, worldDir);
-    raycaster.far = length + 0.045;
-    const h = raycaster.intersectObject(mesh, false)[0];
-    if (h) {
-      hit = h;
-      break;
-    }
-  }
-  raycaster.far = Infinity;
-  if (!hit) {
-    // A hook can graze the cheek without the fist centre ray intersecting it.
-    // Test the swept fist radius against the actual densely sampled surface.
-    const p = mesh.geometry.attributes.position.array,
-      n = mesh.geometry.attributes.normal.array,
-      denom = Math.max(travel.lengthSq(), 1e-12);
-    let best = 0.037 * 0.037,
-      closest = -1;
-    for (let i = 0; i < p.length; i += 3) {
-      if (dynamics.binding && !dynamics.binding.active[i / 3]) continue;
-      const px = p[i] - from.x,
-        py = p[i + 1] - from.y,
-        pz = p[i + 2] - from.z,
-        t = clamp((px * travel.x + py * travel.y + pz * travel.z) / denom, 0, 1);
-      const d =
-        (px - travel.x * t) ** 2 + (py - travel.y * t) ** 2 + (pz - travel.z * t) ** 2;
-      if (d < best) {
-        best = d;
-        closest = i;
-      }
-    }
-    if (closest >= 0)
-      hit = {
-        point: headPivot.localToWorld(
-          new THREE.Vector3(...p.slice(closest, closest + 3)),
-        ),
-        face: { normal: new THREE.Vector3(...n.slice(closest, closest + 3)) },
-      };
-  }
-  if (!hit) return;
-  const point = headPivot.worldToLocal(hit.point.clone());
-  const localDir = velocity
-    .clone()
-    .normalize()
-    .transformDirection(new THREE.Matrix4().copy(headPivot.matrixWorld).invert());
-  const inward = hit.face.normal.clone().normalize();
-  if (inward.dot(localDir) < 0) inward.negate();
-  localDir.multiplyScalar(0.35).addScaledVector(inward, 0.65).normalize();
-  // For an uppercut demo the punch is unambiguously rising into the chin; bias
-  // the impulse direction upward so the recoil pitches back instead of yawing.
-  if (mode === 'uppercut') localDir.set(0, 0.7, -0.6).normalize();
-  if (contact(point, localDir, clamp(speed, 0, 4), source, mode)) hand.lastHit = now;
-}
-
-// Prefer the Newton cage vertex if we have one, then the adaptive rig anchor from detectAnchors
-// (so Meshy/upload heads land on the real cheek/chin), and only as a last resort the reference-frame default.
-function rigGoal(index, fallback) {
-  const cage = dynamics.cage?.positions;
-  if (cage)
-    return new THREE.Vector3(cage[index * 3], cage[index * 3 + 1], cage[index * 3 + 2]);
-  const a = dynamics.impactRig?.anchors?.[index];
-  if (a) return new THREE.Vector3(a[0], a[1], a[2]);
-  return fallback.clone();
+// Scripted showcase punches keep working while the webcam is connected.
+function fireScriptedPunch({ type, side }) {
+  if (!mesh || !dynamics) return false;
+  const punch = createDemoPunch(dynamics, {
+    type,
+    side: side === 'left' ? -1 : 1,
+    magnitude: Number($('impact-strength').value),
+  });
+  const hit = takeDemoContact(dynamics, punch, 1);
+  return contact(
+    new THREE.Vector3(...hit.location),
+    new THREE.Vector3(...hit.direction),
+    hit.magnitude * 1.4,
+    'demo',
+    type,
+    { magnitude: hit.magnitude, side },
+  );
 }
 
 function hook(side) {
   if (!mesh || !meshMatchesSource) return;
+  // Tracked hands own the glove poses, so land the hit directly: a queued demo
+  // swing is skipped by the webcam branch and would only fire on disconnect.
   if (tracking.active) {
-    toast('Disconnect webcam to run a demo hook.');
+    fireScriptedPunch({ type: 'hook', side: side < 0 ? 'left' : 'right' });
     return;
   }
   firstPerson();
@@ -1103,8 +1134,9 @@ function hook(side) {
 
 function uppercut() {
   if (!mesh || !meshMatchesSource) return;
+  // Same as hook(): the webcam drives the hands, so fire the contact directly.
   if (tracking.active) {
-    toast('Disconnect webcam to run a demo uppercut.');
+    fireScriptedPunch({ type: 'uppercut', side: 'right' });
     return;
   }
   firstPerson();
@@ -1114,186 +1146,6 @@ function uppercut() {
     type: 'uppercut',
     magnitude: Number($('impact-strength').value),
   });
-}
-
-// Immediate physical hit from a slap-detector event. Uses the fitted face cage
-// landmarks (50/280 = cheeks, 152 = chin, 1 = nose tip) so the impact lands on
-// the actual mesh regardless of head pose/scale.
-function fireSlap(event) {
-  if (!mesh || !dynamics) return false;
-  let localPoint, localDir;
-  if (event.type === 'uppercut') {
-    localPoint = rigGoal(152, new THREE.Vector3(0, -0.062, 0.048));
-    localDir = new THREE.Vector3(0, 0.85, -0.5).normalize();
-  } else if (event.type === 'jab') {
-    // Nose tip (rig index 1 is Newton-cage-only); adaptive rig doesn't ship an anchor for it,
-    // so fall through to the default which is close to the reference nose tip.
-    localPoint = rigGoal(1, new THREE.Vector3(0, 0.005, 0.062));
-    localDir = new THREE.Vector3(0, 0, -1);
-  } else {
-    const s = event.side === 'left' ? -1 : 1;
-    localPoint = rigGoal(s < 0 ? 50 : 280, new THREE.Vector3(s * 0.045, -0.005, 0.055));
-    localDir = new THREE.Vector3(-s * 0.75, -0.05, -0.6).normalize();
-  }
-  // Raycast from the incoming direction so the impulse lands on the mesh surface
-  // rather than a raw cage anchor which may sit fractionally inside the skin.
-  headPivot.updateWorldMatrix(true, false);
-  const worldPoint = headPivot.localToWorld(localPoint.clone());
-  const worldDir = localDir.clone().transformDirection(headPivot.matrixWorld);
-  raycaster.set(worldPoint.clone().addScaledVector(worldDir, -0.12), worldDir);
-  raycaster.far = 0.3;
-  const hit = raycaster.intersectObject(mesh, false)[0];
-  const finalLocal = hit ? headPivot.worldToLocal(hit.point.clone()) : localPoint;
-  raycaster.far = Infinity;
-  const speed = clamp(0.9 + Math.max(0, event.growth) * 2.6, 0.9, 3.4);
-  const mode =
-    event.type === 'uppercut' ? 'uppercut' : event.type === 'jab' ? 'jab' : 'hook';
-  const landed = contact(finalLocal, localDir, speed, 'webcam', mode, {
-    side: event.side,
-  });
-  if (landed) {
-    $('impact-label').textContent =
-      {
-        hook: event.side === 'left' ? 'LEFT HOOK' : 'RIGHT HOOK',
-        uppercut: 'UPPERCUT',
-        jab: 'STRAIGHT',
-      }[event.type] || 'CONTACT';
-    lastSlapEvent = { ...event, at: performance.now(), landed: true };
-  }
-  return landed;
-}
-
-// MediaPipe hand skeleton (21 landmarks): [wrist, thumb×4, index×4, middle×4, ring×4, pinky×4].
-const SLAP_HAND_LINKS = [
-  [0, 1],
-  [1, 2],
-  [2, 3],
-  [3, 4],
-  [0, 5],
-  [5, 6],
-  [6, 7],
-  [7, 8],
-  [5, 9],
-  [9, 10],
-  [10, 11],
-  [11, 12],
-  [9, 13],
-  [13, 14],
-  [14, 15],
-  [15, 16],
-  [13, 17],
-  [0, 17],
-  [17, 18],
-  [18, 19],
-  [19, 20],
-];
-const SLAP_HAND_TIPS = [4, 8, 12, 16, 20];
-
-function drawSlapHand(state) {
-  const hand = $('slap-view-hand'),
-    links = $('slap-view-hand-links'),
-    fill = $('slap-view-hand-fill'),
-    joints = $('slap-view-hand-joints');
-  if (!state.landmarks || !state.handDetected) {
-    hand.classList.remove('visible', 'armed');
-    links.setAttribute('d', '');
-    fill.setAttribute('points', '');
-    joints.replaceChildren();
-    return;
-  }
-  // Video is mirrored via CSS scaleX(-1); flip x here so the skeleton lines up with the user's hand.
-  const pts = state.landmarks.map((p) => ({
-    x: 1 - clamp(p.x, 0, 1),
-    y: clamp(p.y, 0, 1),
-  }));
-  links.setAttribute(
-    'd',
-    SLAP_HAND_LINKS.map(
-      ([a, b]) =>
-        `M${pts[a].x.toFixed(4)} ${pts[a].y.toFixed(4)}L${pts[b].x.toFixed(4)} ${pts[b].y.toFixed(4)}`,
-    ).join(''),
-  );
-  fill.setAttribute(
-    'points',
-    SLAP_HAND_TIPS.map((i) => `${pts[i].x.toFixed(4)},${pts[i].y.toFixed(4)}`).join(
-      ' ',
-    ),
-  );
-  if (joints.childElementCount !== pts.length) {
-    joints.replaceChildren(
-      ...pts.map(() =>
-        document.createElementNS('http://www.w3.org/2000/svg', 'circle'),
-      ),
-    );
-  }
-  for (let i = 0; i < pts.length; i++) {
-    const c = joints.children[i];
-    c.setAttribute('cx', pts[i].x.toFixed(4));
-    c.setAttribute('cy', pts[i].y.toFixed(4));
-    c.setAttribute('r', SLAP_HAND_TIPS.includes(i) ? 0.014 : i === 0 ? 0.017 : 0.008);
-  }
-  hand.classList.add('visible');
-  // "Armed" — palm is inside the trigger range. The fingertip polygon still grows/shrinks
-  // continuously with palm size, so users see the ramp toward this yellow state.
-  hand.classList.toggle('armed', state.palmWidth >= slapDetector.tuning.minWidth);
-}
-
-function updateSlapHud(nowMs) {
-  const s = slapDetector.state,
-    t = slapDetector.tuning;
-  const widthPct = clamp(s.palmWidth / 0.3, 0, 1) * 100;
-  const growthPct = clamp(s.growth / 0.9, 0, 1) * 100;
-  const vyPct = clamp(-s.vy / 1.5, -1, 1) * 50;
-  $('slap-width-fill').style.width = widthPct + '%';
-  $('slap-width-mark').style.left = (t.minWidth / 0.3) * 100 + '%';
-  $('slap-growth-fill').style.width = growthPct + '%';
-  $('slap-growth-mark').style.left = (t.minGrowth / 0.9) * 100 + '%';
-  const vyFill = $('slap-vy-fill');
-  vyFill.style.left = (vyPct >= 0 ? 50 : 50 + vyPct) + '%';
-  vyFill.style.width = Math.abs(vyPct) + '%';
-  vyFill.classList.toggle('rising', s.vy < 0);
-  $('slap-vy-mark').style.left = 50 + (t.minVerticalUp / 1.5) * 50 + '%';
-  $('slap-width-val').textContent = s.palmWidth.toFixed(2);
-  $('slap-growth-val').textContent = s.growth.toFixed(1) + '/s';
-  $('slap-vy-val').textContent = (-s.vy).toFixed(1) + '/s up';
-  drawSlapHand(s);
-  if (s.triggered) {
-    const flash = $('slap-view-flash');
-    flash.className = '';
-    void flash.offsetWidth;
-    flash.className = 'fire type-' + s.triggered.type;
-  }
-  const badge = $('slap-state-badge');
-  const stateClass = s.triggered
-    ? 'hit'
-    : s.handDetected
-      ? s.reason.startsWith('ready')
-        ? 'armed'
-        : 'watching'
-      : 'idle';
-  badge.className = 'slap-badge ' + stateClass;
-  badge.textContent = s.triggered
-    ? s.reason
-    : s.handDetected
-      ? s.reason
-      : tracking.active
-        ? 'searching'
-        : 'idle';
-  if (lastSlapEvent) {
-    const age = Math.round(nowMs - lastSlapEvent.at);
-    const label =
-      {
-        hook: lastSlapEvent.side === 'left' ? 'LEFT HOOK' : 'RIGHT HOOK',
-        uppercut: 'UPPERCUT',
-        jab: 'STRAIGHT',
-      }[lastSlapEvent.type] || 'HIT';
-    $('slap-last').innerHTML = /* HTML */ `<span class="tag-${lastSlapEvent.type}"
-        >${label}</span
-      >
-      · ${age < 1000 ? age + ' ms' : (age / 1000).toFixed(1) + ' s'} ago`;
-  } else if (tracking.active) {
-    $('slap-last').textContent = '—';
-  }
 }
 
 function drawTrace() {
@@ -1326,11 +1178,23 @@ let lastTime = performance.now(),
 function frame(time) {
   const dt = Math.min((time - lastTime) / 1000, 1 / 30);
   lastTime = time;
+  const trackingFrames = tracking.drainResults(time);
+  liveArms.update(
+    time,
+    document.hidden ||
+      !!$('face-scan-dialog')?.open ||
+      !!demoFlow?.isOpen ||
+      quickArms.isOpen,
+  );
   // The scene is obscured during capture. Give decoding/tracking the CPU,
   // and avoid simulating hidden tabs while another local demo is active.
-  if (document.hidden || $('face-scan-dialog')?.open) return;
+  if (document.hidden || $('face-scan-dialog')?.open) {
+    webcamPunching.tick(null, time, false);
+    return;
+  }
   // Keep tracking live for calibration, but the blurred scene needs only a still preview.
-  if (demoFlow?.isOpen) {
+  if (demoFlow?.isOpen || quickArms.isOpen) {
+    webcamPunching.tick(null, time, false);
     if (tracking.active) tracking.tick(time, hands);
     if (time - onboardingFrameTime > 100) {
       controls.update();
@@ -1341,7 +1205,6 @@ function frame(time) {
   }
   const now = time / 1000;
   if (tracking.active) {
-    tracking.tick(time, hands);
     mode = 'webcam';
   } else {
     mode = 'demo';
@@ -1376,26 +1239,23 @@ function frame(time) {
           toast('Punch could not be applied. Check the physics status.');
         if (t > 1) {
           demo = null;
-          hand.demoPose(new THREE.Vector3(side * 0.11, -0.1, -0.32), 0);
+          hand.demoPose(new THREE.Vector3(side * 0.11, -0.1, -0.32));
         } else {
           const a = clamp(t / 0.52, 0, 1),
             b = clamp((t - 0.52) / 0.48, 0, 1);
           const strike = Math.sin((a * Math.PI) / 2) * (1 - b);
           const goal = demo.goal;
-          // With the webcam disabled the CV pipeline can't supply a fist score. Ramp the mesh
-          // into a closed fist as the strike winds up (a→1) and hold it through the impact,
-          // opening back up as the follow-through decays (b→1) so the recovery reads as relaxed.
-          const closedAmount = clamp(a - b * 0.6, 0, 1);
+          // Keep the fist closed throughout wind-up, impact, and recovery.
           if (demo.type === 'uppercut') {
             const x = side * 0.05 * (1 - strike) + goal.x * strike,
               y = -0.32 * (1 - strike) + (goal.y - 0.005) * strike,
               z = -0.3 * (1 - strike) + (goal.z - 0.02) * strike;
-            hand.demoPose(new THREE.Vector3(x, y, z), closedAmount);
+            hand.demoPose(new THREE.Vector3(x, y, z));
           } else {
             const x = side * 0.24 * (1 - strike) + (goal.x - side * 0.02) * strike,
               y = -0.13 * (1 - strike) + (goal.y + 0.012) * strike,
               z = -0.24 * (1 - strike) + (goal.z - 0.023) * strike;
-            hand.demoPose(new THREE.Vector3(x, y, z), closedAmount);
+            hand.demoPose(new THREE.Vector3(x, y, z));
           }
         }
       } else {
@@ -1405,29 +1265,10 @@ function frame(time) {
             -0.1 + Math.sin(now * 1.4 + side) * 0.002,
             -0.32,
           ),
-          0,
         );
       }
     }
   }
-  if (tracking.active && tracking.calibration)
-    for (const h of hands)
-      if (h.tracked && h.updated) checkContact(h, h.sampleDt, now, 'webcam');
-  // Palm-approach detector: primary punch trigger. Doesn't require guard calibration
-  // and covers both fists and open palms.
-  if (
-    tracking.active &&
-    tracking.results &&
-    tracking.results.timestamp !== lastSlapResultTs
-  ) {
-    lastSlapResultTs = tracking.results.timestamp;
-    const trigger = slapDetector.observe(
-      tracking.results.landmarks,
-      tracking.results.timestamp,
-    );
-    if (trigger) fireSlap(trigger);
-  }
-  updateSlapHud(time);
   if (dynamics) {
     dynamics.speechRig.set(window.__faceSpeech?.read(dt));
     if (!impactHeld) {
@@ -1471,13 +1312,46 @@ function frame(time) {
       mesh.geometry.attributes.normal.array,
     );
   if (headHair) headHair.updateSurface(mesh.geometry);
+  // Teeth and tongue swing with the jaw and give way with punched lips.
+  if (mouthInterior && dynamics)
+    mouthInterior.update({
+      swing: dynamics.jawSwing,
+      offsets: [dynamics.offset, dynamics.impactRig.offset],
+    });
+  controls.update();
+  if (tracking.active) {
+    // Preserve every inference sample, including an out-and-back punch between
+    // render frames. The final sample is also the pose drawn below.
+    for (const result of trackingFrames) {
+      tracking.tick(time, hands, result);
+      quickArms.update(hands, dt / trackingFrames.length);
+      webcamPunching.tick(result, time, demoFlow?.canPunch !== false);
+    }
+  } else webcamPunching.tick(null, time, false);
+  updatePunchHud(tracking.results, time, tracking.active);
   for (const h of hands) {
     const arm = scannedArms.get(h.side < 0 ? 'left' : 'right');
-    if (arm) arm.updateFromHand(h);
-    // Neon line skeleton shows whenever no scanned arm has taken over.
-    h.line.visible = !arm;
+    if (arm) {
+      arm.updateFromHand(h);
+      arm.visible = arm.visible && liveArms.display === 'captured';
+    }
+    h.line.visible =
+      liveArms.display === 'wireframe' ||
+      (liveArms.display === 'live' && !tracking.active && $('demo-hands').checked);
   }
-  if (scannedArms.size && normalClock % 15 === 0) {
+  if (!tracking.active)
+    quickArms.update(demo ? hands.filter((h) => h.side === demo.side) : [], dt);
+  $('view-label').textContent =
+    liveArms.display === 'live'
+      ? liveArms.source === 'body'
+        ? 'FIRST-PERSON · LIVE CAMERA ARMS'
+        : 'LIVE CAMERA ARMS · FRONT VIEW'
+      : liveArms.display === 'wireframe'
+        ? 'SKELETON ARMS · ORIGINAL'
+        : liveArms.display === 'preset'
+          ? 'FIRST-PERSON · MY 3D ARMS'
+          : 'CAPTURED ARM MESHES';
+  if (scannedArms.size && liveArms.display === 'captured' && normalClock % 15 === 0) {
     const visible = [...scannedArms]
       .filter(([, arm]) => arm.visible)
       .map(([side]) => side);
@@ -1492,7 +1366,6 @@ function frame(time) {
   }
   impactControls.update();
   realismControls?.update();
-  controls.update();
   renderer.render(scene, camera);
   frames++;
   if (time - fpsTime > 750) {
@@ -1676,17 +1549,18 @@ async function cameraToggle() {
     $('camera').textContent = 'Connect laptop webcam';
     $('webcam').classList.remove('active');
     $('calibrate').disabled = true;
-    $('tracking-status').textContent = 'Camera off. Virtual hands are in demo mode.';
+    $('tracking-status').textContent =
+      'Punch camera off. Q / E still work for demo punches.';
     $('stage-status').textContent = '● DEMO INPUT';
     $('slap-preview').srcObject = null;
     $('slap-hud').classList.remove('active');
-    slapDetector.reset();
-    lastSlapEvent = null;
+    webcamPunching.reset();
     return;
   }
   $('camera').disabled = true;
   try {
-    await tracking.start();
+    await tracking.start(liveArms.targetDeviceId);
+    await liveArms.refreshDevices();
     demo = null;
     demoQueue.length = 0;
     firstPerson();
@@ -1727,6 +1601,8 @@ if (sessionStorage.getItem(CAMERA_WANTED_KEY) === '1')
   queueMicrotask(() => cameraToggle().catch(() => {}));
 window.addEventListener('pagehide', () => {
   tracking.stop();
+  liveArms.dispose();
+  quickArms.dispose();
   dynamics?.dispose?.();
 });
 if (import.meta.hot) {
@@ -1734,6 +1610,7 @@ if (import.meta.hot) {
   // again, or the browser hands out overlapping tracks and one ends up orphaned.
   import.meta.hot.dispose(() => {
     tracking.stop();
+    liveArms.dispose();
     dynamics?.dispose?.();
   });
 }
@@ -1749,13 +1626,22 @@ $('face-file').onchange = async (e) => {
       throw new Error('Use a GLB or editable session smaller than 180 MB.');
     const ext = file.name.split('.').pop().toLowerCase();
     if (ext === 'json') {
-      await restoreSession(JSON.parse(await file.text()));
+      const session = JSON.parse(await file.text());
+      const name = await requestHeadName({
+        name: session.name || nameFromFile(file.name),
+      });
+      if (name === null) return;
+      await restoreSession({ ...session, name });
       window.dispatchEvent(
         new CustomEvent('punching-face-model-loaded', { detail: { name: file.name } }),
       );
       return;
     }
     if (ext === 'glb') {
+      const name =
+        e.detail?.headName ??
+        (await requestHeadName({ name: nameFromFile(file.name) }));
+      if (name === null) return;
       const gltf = await new GLTFLoader().parseAsync(await file.arrayBuffer(), '');
       const meshes = [];
       gltf.scene.updateMatrixWorld(true);
@@ -1786,7 +1672,7 @@ $('face-file').onchange = async (e) => {
       if (m.userData.coordinateSystem !== 'punching-face-head-metres-v1') {
         normalizeHead(g);
       }
-      sourceName = file.name;
+      sourceName = name;
       photoData = null;
       sourceBytes = null;
       const uploadedAnchors =
@@ -1914,12 +1800,23 @@ async function exportGLB() {
     );
     hairSource.computeVertexNormals();
     const exportedHair = headHair ? new HeadHair(hairSource, headHair.spec) : null;
+    const exportedHairCap =
+      headHairCap && headHair
+        ? new HeadHairSurface(hairSource, {
+            ...headHair.spec.cap,
+            hairlineY: headHair.spec.hairlineY,
+          })
+        : null;
     const bundle = new THREE.Group();
     bundle.name = 'Editable head and accessories';
     bundle.add(out);
     if (exportedHair) {
       exportedHair.visible = headHair.visible;
       bundle.add(exportedHair);
+    }
+    if (exportedHairCap) {
+      exportedHairCap.visible = headHair.visible;
+      bundle.add(exportedHairCap);
     }
     const exportedGlasses = headGlasses ? new HeadGlasses(headGlasses.spec) : null;
     if (exportedGlasses) {
@@ -1932,6 +1829,7 @@ async function exportGLB() {
     });
     exportedGlasses?.dispose();
     exportedHair?.dispose();
+    exportedHairCap?.dispose();
     hairSource.dispose();
     const saved = await fetch('/api/save?type=glb', {
       method: 'POST',
@@ -2028,6 +1926,7 @@ function sessionData() {
 }
 
 async function restoreSession(data) {
+  requireCompleteHead(data.stats, data.appearanceAtlas?.stats);
   if (
     data.format !== 'punching-face-session' ||
     data.version !== 1 ||
@@ -2067,7 +1966,10 @@ async function restoreSession(data) {
   sourceName = data.name || 'Saved face';
   photoData = data.photo ?? null;
   sourceBytes = null;
-  installMesh(g, mat, data.stats);
+  // Restore the saved texture and physics landmarks before classifying lips.
+  // Otherwise the automatic fit can finish during Newton's asynchronous connect
+  // and cache labels from an incomplete head before the final fit runs.
+  installMesh(g, mat, data.stats, { deferMouth: true });
   if (
     data.original?.length === dynamics.rest.length &&
     data.original.every(Number.isFinite)
@@ -2118,6 +2020,7 @@ async function restoreSession(data) {
   installHair(data.accessories?.hair);
   restoreAccessoryVisibility(data.accessories);
   await realismControls?.restore(data.realism);
+  await fitMouth(!!dynamics?.cage?.rigAnchors);
   firstPerson();
   toast('Editable session restored. Re-import a room asset separately.');
 }
@@ -2153,54 +2056,19 @@ $('save').onclick = async () => {
 $('capture-open').onclick = () => $('capture-dialog').showModal();
 $('capture-close').onclick = () => $('capture-dialog').close();
 
-async function photoFace(image) {
-  busy(true, 'Estimating a portrait mesh…');
-  try {
-    const result = await makePhotoFace(image);
-    photoData = result.photo;
-    sourceName = 'Your portrait preview';
-    sourceBytes = null;
-    installMesh(result.geometry, result.material, {
-      source: 'Single image landmark proxy',
-      limitation: 'Estimated depth. Single-view estimate. Unseen surfaces unavailable.',
-    });
-    const landmarkAnchors = anchorsFromLandmarks(dynamics?.rest);
-    /* Speech only: the impact rig is tuned against the default table on this path, so re-anchoring it would silently change how every punch looks. */ if (
-      landmarkAnchors
-    )
-      dynamics.speechRig.setAnchors(landmarkAnchors);
-    fitMouth(!!landmarkAnchors);
-    $('model-kind').textContent = 'Photo proxy · estimated depth';
-    $('capture-dialog').close();
-    toast(
-      'Your portrait is ready. This is a frontal mesh preview, not a complete scan.',
-    );
-  } catch (e) {
-    $('capture-result').textContent = e.message;
-    toast(e.message);
-  } finally {
-    busy(false);
-  }
-}
-
-$('snapshot').onclick = async () => {
-  if (!tracking.active) {
-    await cameraToggle();
-  }
-  if (tracking.active) await photoFace($('webcam'));
-};
+// All local capture entry points use the full-head reconstruction pipeline.
+$('snapshot').onclick = () => openFaceScan();
 $('photo-import').onclick = () => $('photo-file').click();
 $('photo-file').onchange = async (e) => {
-  const file = e.target.files[0];
-  if (!file) return;
-  const url = URL.createObjectURL(file);
+  const files = [...e.target.files];
+  if (!files.length) return;
   try {
-    const image = new Image();
-    image.src = url;
-    await image.decode();
-    await photoFace(image);
+    $('capture-dialog').close();
+    await faceCapture.open();
+    await faceCapture.importPhotos(files);
+  } catch (error) {
+    toast(error.message);
   } finally {
-    URL.revokeObjectURL(url);
     e.target.value = '';
   }
 };
@@ -2229,7 +2097,10 @@ async function loadPhotoFace(id) {
       URL.revokeObjectURL(textureURL);
     }
     texture.colorSpace = THREE.SRGBColorSpace;
-    sourceName = 'Your photo model';
+    const status = await fetch('/api/face-status?id=' + encodeURIComponent(id)).then(
+      (response) => response.json(),
+    );
+    sourceName = status.name || 'Your photo model';
     sourceBytes = null;
     photoData = null;
     sourceTransform = data.transform;
@@ -2256,8 +2127,16 @@ async function loadPhotoFace(id) {
     sessionStorage.setItem('punching-face-active-capture', id);
     installGlasses(data.accessories?.glasses);
     installHair(data.accessories?.hair);
+    // Cut the lip seam before the solver binds to the vertex buffer, so Newton
+    // starts once, on the final mesh. The binding grows with the new vertices.
+    await fitMouth(!!cage.rigAnchors, cage);
     dynamics?.dispose?.();
-    dynamics = new NewtonFaceDynamics(mesh.geometry, binding, cage, physicsStatus);
+    dynamics = new NewtonFaceDynamics(
+      mesh.geometry,
+      growBinding(binding, mesh.geometry),
+      cage,
+      physicsStatus,
+    );
     dynamics.softness = Number($('softness').value);
     fitMouth(!!cage.rigAnchors);
     for (let i = 0; i < rigMarkers.children.length; i++) {
@@ -2431,6 +2310,8 @@ window.__punchingFace = {
           }
         : null,
       cameraActive: tracking.active,
+      liveArms: liveArms.state,
+      quickArms: quickArms.state,
       calibrated: !!tracking.calibration,
       trackedHands: hands.filter((h) => h.tracked).length,
       lastTrackingTimestamp: tracking.appliedTimestamp,
@@ -2463,6 +2344,7 @@ window.__punchingFace = {
             height: mesh.geometry.userData.mouthAperture.height,
             centre: mesh.geometry.userData.mouthAperture.centre,
             cavity: !!mouthCavity,
+            teeth: mouthInterior ? mouthInterior.riders.length - 1 : 0,
             ring: mesh.geometry.userData.mouthAperture.ring,
             anchors: dynamics?.speechRig?.anchors,
           }
@@ -2491,27 +2373,24 @@ window.__punchingFace = {
   },
   sessionData,
   restoreSession,
-  get slap() {
+  get punchCV() {
     return {
-      state: slapDetector.state,
-      tuning: slapDetector.tuning,
-      lastEvent: lastSlapEvent,
+      state: (webcamPunching.screen ?? webcamPunching.tracker).debug,
+      stats: (webcamPunching.screen ?? webcamPunching.tracker).stats,
+      probe: webcamPunching.tracker.probe,
+      lastEvent: webcamPunching.lastEvent,
     };
   },
-  tuneSlap(patch) {
-    Object.assign(slapDetector.tuning, patch);
-  },
-  // Direct injection of a synthetic landmark stream. Frames = array of {t, landmarks}.
-  feedSlap(frames) {
-    slapDetector.reset();
-    lastSlapEvent = null;
-    const out = [];
-    for (const f of frames) {
-      const trig = slapDetector.observe(f.landmarks, f.t);
-      if (trig) fireSlap(trig);
-      out.push({ t: f.t, reason: slapDetector.state.reason, triggered: trig });
+  // Replay complete worker results through the same path as the live camera.
+  feedPunchFrames(frames) {
+    webcamPunching.reset();
+    const events = [];
+    for (const frame of frames) {
+      const event = webcamPunching.tick(frame, frame.timestamp + 8, true);
+      if (event) events.push(webcamPunching.lastEvent);
     }
-    return out;
+    webcamPunching.enabled = false;
+    return events;
   },
 };
 const impactControls = installImpactControls({
@@ -2531,6 +2410,7 @@ window.__punchingFace.applyImpact = impactControls.applyImpact;
 window.__punchingFace.setHeadMode = impactControls.setMode;
 window.addEventListener('punching-face-mode-change', ({ detail }) => {
   if (mouthCavity) mouthCavity.visible = detail.mode !== 'clay';
+  if (mouthInterior) mouthInterior.visible = detail.mode !== 'clay';
 });
 realismControls = installRealismControls({
   getTarget: (current) => {
@@ -2577,8 +2457,101 @@ window.addEventListener('face-impact', (event) => {
 firstPerson();
 const recovery = sessionStorage.getItem('punching-face-dev-recovery');
 
+async function loadNativePreview(id) {
+  busy(true, 'Loading the independent photo reconstruction…');
+  try {
+    if (!/^[a-z0-9-]+$/i.test(id)) throw new Error('Invalid native preview id.');
+    const gltf = await new GLTFLoader().loadAsync(
+      `/generated/${encodeURIComponent(id)}/model.glb?v=${Date.now()}`,
+    );
+    const meshes = [];
+    gltf.scene.updateMatrixWorld(true);
+    gltf.scene.traverse((object) => {
+      if (object.isMesh) meshes.push(object);
+    });
+    const faces = meshes.filter(
+      (object) => !['eyeglasses', 'hair'].includes(object.userData.accessory),
+    );
+    if (!faces.length) throw new Error('The native preview contains no head mesh.');
+    const m = faces.reduce((a, b) =>
+      (b.geometry.index?.count ?? b.geometry.attributes.position.count) >
+      (a.geometry.index?.count ?? a.geometry.attributes.position.count)
+        ? b
+        : a,
+    );
+    const g = importedHeadGeometry(m);
+    if (m.userData.coordinateSystem !== 'punching-face-head-metres-v1')
+      normalizeHead(g);
+    sourceName = 'Independent photo head · separate eyewear';
+    photoData = null;
+    sourceBytes = null;
+    if (m.material.map && m.userData.appearance) {
+      const recovered = weldTexturedSurface(g);
+      recovered.atlas.stats = {
+        ...m.userData.appearanceStats,
+        // The native photo atlas carries baked color, but the rear crown is
+        // under-readable when it is rendered as an unlit billboard. A
+        // restrained physical-photo response preserves the atlas while
+        // allowing the captured hair texture to catch profile light.
+        material:
+          m.userData.appearanceStats?.material === 'photo'
+            ? 'physical-photo'
+            : m.userData.appearanceStats?.material,
+      };
+      installMesh(
+        recovered.geometry,
+        null,
+        m.userData.reconstruction ?? { source: 'Independent photo reconstruction' },
+      );
+      surfaceAppearance = new SurfaceAppearance(
+        mesh.geometry,
+        recovered.atlas,
+        m.material.map.clone(),
+        m.material.roughnessMap?.clone(),
+      );
+      headPivot.add(surfaceAppearance);
+      g.dispose();
+      setView('mesh');
+    } else {
+      installMesh(
+        g,
+        m.material.clone(),
+        m.userData.reconstruction ?? { source: 'Independent photo reconstruction' },
+      );
+    }
+    if (m.userData.rigAnchors) {
+      dynamics.impactRig.setAnchors(m.userData.rigAnchors);
+      dynamics.speechRig.setAnchors(m.userData.rigAnchors);
+    }
+    installGlasses(m.userData.accessories?.glasses);
+    installHair(
+      remapHairRoots(
+        m.userData.accessories?.hair,
+        g.attributes.position.array,
+        mesh.geometry.attributes.position.array,
+      ),
+    );
+    restoreAccessoryVisibility(m.userData.accessories);
+    $('model-kind').textContent = 'Independent photo reconstruction · experimental';
+    $('photo-count').textContent = 'Registered source photos · local pipeline';
+    $('physics-engine').textContent = 'Preview springs + facial impact rig';
+    firstPerson();
+    setView('mesh');
+    toast(
+      'Independent photo model ready. Inspect the crown, glasses and impact response.',
+    );
+  } finally {
+    busy(false);
+  }
+}
+
 async function recover() {
   try {
+    const nativePreview = new URLSearchParams(location.search).get('nativePreview');
+    if (nativePreview) {
+      await loadNativePreview(nativePreview);
+      return;
+    }
     if (recovery) {
       let saved = JSON.parse(recovery);
       if (saved.format === 'punching-face-session-pointer') {
@@ -2731,24 +2704,190 @@ const lipDebug = (() => {
     return false;
   }
 })();
-async function fitMouth(trustAnchors = false) {
+// installMesh starts a fit before its caller has attached a texture or a Newton
+// binding, and most callers then ask again. Only the newest fit may commit, and
+// fits of one head share one look at it.
+let mouthFitToken = 0;
+const lipDetections = new WeakMap();
+// The detector measures the rest pose: that is the surface the lips are cut into,
+// whatever the jaw slider or a sentence in progress is doing to the mesh.
+function showRestPose() {
+  const position = mesh?.geometry.attributes.position;
+  if (!position || dynamics?.rest?.length !== position.array.length) return;
+  position.array.set(dynamics.rest);
+  position.needsUpdate = true;
+  mesh.geometry.computeVertexNormals();
+  surfaceAppearance?.updateSurface(
+    position.array,
+    mesh.geometry.attributes.normal.array,
+  );
+}
+// Swap a head for the same head with its lip seam cut (src/lip-topology.js).
+// Everything that can refuse is built before the scene is touched, so a failure
+// leaves the head exactly as it was.
+function adoptLipGeometry(plan) {
+  const old = dynamics,
+    previous = mesh.geometry,
+    geometry = plan.geometry,
+    newton = old instanceof NewtonFaceDynamics;
+  const next = newton
+    ? new NewtonFaceDynamics(
+        geometry,
+        growBinding(old.binding, geometry, plan.parents),
+        old.cage,
+        physicsStatus,
+      )
+    : new FaceDynamics(geometry);
+  const appearance = surfaceAppearance
+    ? new SurfaceAppearance(
+        geometry,
+        plan.atlas,
+        surfaceAppearance.material.map,
+        surfaceAppearance.material.roughnessMap,
+      )
+    : null;
+  next.softness = old.softness;
+  next.rig = old.rig;
+  next.original = growVertexField(old.original, plan.parents, { offset: true });
+  next.impactRig.setAnchors(old.impactRig.anchors);
+  next.speechRig.setAnchors(old.speechRig.anchors);
+  const impact = old.impactRig.snapshot();
+  next.impactRig.restore({
+    mode: impact.mode,
+    permanent: Array.from(
+      growVertexField(Float32Array.from(impact.permanent), plan.parents),
+    ),
+  });
+  mesh.geometry = geometry;
+  if (clayMesh) clayMesh.geometry = geometry;
+  if (wireMesh) wireMesh.geometry = geometry;
+  // The inside of the mouth is darkened through vertex colour (src/lip-fit.js).
+  if (!mesh.material.vertexColors) {
+    mesh.material.vertexColors = true;
+    mesh.material.needsUpdate = true;
+  }
+  if (appearance) {
+    // Not dispose(): that would free the textures the new surface now shares.
+    surfaceAppearance.removeFromParent();
+    surfaceAppearance.geometry.dispose();
+    surfaceAppearance.material.dispose();
+    appearance.visible = surfaceAppearance.visible;
+    surfaceAppearance = appearance;
+    headPivot.add(appearance);
+  }
+  dynamics = next;
+  old.dispose?.();
+  previous.dispose();
+  lipDetections.set(geometry, lipDetections.get(previous));
+  // A solver that was already starting is restarted on the new vertex buffer; one
+  // that was not is left to its caller, which connects whatever `dynamics` is.
+  if (newton && old.generation !== undefined)
+    void next.connect(capturedFaceId, old.generation).catch(() => {});
+  $('mesh-count').textContent =
+    `${(geometry.index.count / 3).toLocaleString()} triangles · editable`;
+  revision++;
+}
+// Give the head lips that can part, or find the ones it already has.
+function fitLips(detection) {
+  let topology = lipTopologyOf(mesh.geometry);
+  if (!topology) {
+    if (!detection) return { refused: 'no face detected' };
+    // The MediaPipe canonical face already has lip rings; installMesh opened it.
+    if (mesh.geometry.userData?.mouthAperture) return { refused: 'canonical lips' };
+    const plan = planLipCut({
+      geometry: mesh.geometry,
+      rest: dynamics.rest,
+      atlas: surfaceAppearance?.atlas ?? null,
+      detection,
+    });
+    if (plan.refused) return plan;
+    if (plan.native) {
+      // Lips the head already had (a template fit's): nothing to swap in. Label
+      // them where they are and darken the untextured mouth behind them.
+      mesh.geometry.userData = {
+        ...mesh.geometry.userData,
+        lipTopology: plan.topology,
+      };
+      if (plan.indices) {
+        // Faces that bridged the two lips are gone; the vertex buffer is as it was.
+        mesh.geometry.setIndex(new THREE.BufferAttribute(plan.indices, 1));
+        if (surfaceAppearance && plan.atlas) {
+          surfaceAppearance.geometry.setIndex(plan.atlas.indices);
+          surfaceAppearance.atlas = plan.atlas;
+        }
+      }
+      shadeMouth(mesh.geometry, plan.topology.shade);
+      surfaceAppearance?.shadeMouth(plan.topology.shade);
+      if (!mesh.material.vertexColors) {
+        mesh.material.vertexColors = true;
+        mesh.material.needsUpdate = true;
+      }
+      revision++;
+    } else adoptLipGeometry(plan);
+    topology = plan.topology;
+  }
+  // Whatever order the head was assembled in, the surface that is drawn carries
+  // the mouth's shading. It records that on its atlas, so this happens once.
+  if (surfaceAppearance && !surfaceAppearance.atlas.shade)
+    surfaceAppearance.shadeMouth(topology.shade);
+  dynamics.setLipTopology(topology);
+  return { topology };
+}
+// `cage` is a local scan's own landmarks, for a caller that has them before the
+// solver that will carry them exists.
+async function fitMouth(
+  trustAnchors = false,
+  cage = dynamics?.cage,
+  { settle = false } = {},
+) {
+  const token = ++mouthFitToken;
   try {
     mouthCavity?.dispose();
     mouthCavity = null;
     if (!mesh) return null;
-    // Look at the head before cutting it. A landmarker run on a render of this
-    // exact mesh beats every inferred anchor, and it is the only thing that
-    // works on an arbitrary uploaded GLB.
-    const detection = await detectFaceOnMesh({
-      renderer,
-      scene,
-      mesh,
-      headPivot,
-      debug: lipDebug,
-    });
+    const target = mesh;
+    // A cut has to split the textured surface along with the mesh, so it must not
+    // run in the gap between installMesh and the caller attaching that surface.
+    while (settle && $('busy').classList.contains('active')) {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      if (token !== mouthFitToken || mesh !== target) return null;
+    }
+    if (clearLegacyMouthShading(mesh.geometry, surfaceAppearance))
+      dynamics.setLipTopology(null);
+    // A local scan's landmarks ARE vertices of its mesh, so its lip line is known
+    // exactly and no render of it can do better.
+    const own = detectionFromCage(cage ?? dynamics?.cage);
+    let seen = null;
+    if (!own) {
+      // Any other head: look at it. A landmarker run on a render of this exact
+      // mesh beats every inferred anchor, and it is the only thing that works on
+      // an arbitrary uploaded GLB.
+      let look = lipDetections.get(mesh.geometry);
+      if (!look || look.textured !== !!surfaceAppearance) {
+        look = {
+          textured: !!surfaceAppearance,
+          result: detectFaceOnMesh({
+            renderer,
+            scene,
+            mesh,
+            headPivot,
+            debug: lipDebug,
+            prepare: showRestPose,
+          }),
+        };
+        lipDetections.set(mesh.geometry, look);
+      }
+      seen = await look.result;
+      if (token !== mouthFitToken || mesh !== target) return null;
+    }
+    // The landmarker is believed only when it confirmed the face close up, with a
+    // nose that stands proud of the eyes: shown a neck stump and nothing else, it
+    // finds a face in that.
+    const detection = own ?? (trustedDetection(seen) ? seen : null);
     // Browser-QA handle: what the detector was shown and what it made of it.
     window.__faceDetection = {
       ok: !!detection,
+      seen: !!(own ?? seen),
       framing: detection?.framing,
       mouthWidthNdc: detection?.mouthWidthNdc,
       anchors: detection?.anchors,
@@ -2756,7 +2895,54 @@ async function fitMouth(trustAnchors = false) {
       render: lastDetectorRender(),
     };
     if (detection?.anchors && dynamics?.speechRig)
-      dynamics.speechRig.setAnchors(detection.anchors);
+      dynamics.speechRig.setAnchors(soundAnchors(detection.anchors));
+    const lips = fitLips(detection);
+    window.__faceDetection.lips = lips.refused ?? {
+      mode: lips.topology.native ? 'adopted' : 'cut',
+      seam: lips.topology.seam.length || lips.topology.seamPoints.length / 3,
+      upper: lips.topology.upper.length,
+      lower: lips.topology.lower.length,
+      shaded: lips.topology.shade?.vertices.length ?? 0,
+      // What is actually drawn dark, which is the render copies, not the list.
+      drawnDark: (() => {
+        const drawn = surfaceAppearance ?? mesh,
+          color = drawn.geometry.attributes.color;
+        let dark = 0;
+        if (color) for (let i = 0; i < color.count; i++) dark += color.getX(i) < 0.5;
+        return { vertexColors: drawn.material.vertexColors, dark };
+      })(),
+      addedVertices: lips.topology.addedVertices,
+      addedTriangles: lips.topology.addedTriangles,
+    };
+    // A seamed mouth carries its own inside, which moves with the jaw, so it
+    // needs no dark void parked behind the lips. It gets teeth and a tongue,
+    // whichever engine built the head (src/mouth-interior.js).
+    if (lips.topology) {
+      if (mouthInterior?.topology !== lips.topology) {
+        mouthInterior?.dispose();
+        mouthInterior = MouthInterior.build({
+          rest: dynamics.rest,
+          indices: mesh.geometry.index.array,
+          topology: lips.topology,
+        });
+        if (mouthInterior) {
+          mouthInterior.visible = $('head-mode').value !== 'clay';
+          headPivot.add(mouthInterior);
+        }
+      }
+      window.__faceDetection.lips.teeth = mouthInterior
+        ? mouthInterior.riders.length - 1
+        : 0;
+      return { strategy: 'seam', ...lipOpening(dynamics.rest, lips.topology) };
+    }
+    mouthInterior?.dispose();
+    mouthInterior = null;
+    // Only a mouth installMesh already opened (the canonical face has real lip
+    // rings, removed exactly) or a head nobody could see a face on goes on to the
+    // triangle-deleting aperture. A face that was seen but could not be given a
+    // clean seam keeps its lips sealed: deleting whole triangles there is what
+    // left black shards across a closed mouth.
+    if (detection && !mesh.geometry.userData?.mouthAperture) return null;
     const aperture = openMouthAperture(
       mesh.geometry,
       detection?.anchors ?? dynamics?.speechRig?.anchors,
@@ -2935,6 +3121,7 @@ async function meshyBuildFromPhoto() {
     const blob = await meshyCapturePhoto();
     busy(true, 'Saving your head photo…');
     meshyState.captureId = await startMeshyPhoto(blob);
+    if (!meshyState.captureId) return false;
     $('beat-yourself').disabled = false;
     toast('Photo saved. Meshy is building in the background — keep punching.');
     return true;
@@ -2974,11 +3161,20 @@ $('beat-yourself').onclick = async () => {
     busy(false);
   }
   firstPerson();
-  // fireSlap ignores the "disconnect webcam" guard on the demo helpers, so the beat-yourself
+  // fireScriptedPunch ignores the "disconnect webcam" guard on the demo helpers, so the beat-yourself
   // combo still lands when the user has their camera on for tracking.
-  setTimeout(() => fireSlap({ type: 'uppercut', growth: 1.4, side: 'left' }), 300);
-  setTimeout(() => fireSlap({ type: 'hook', growth: 1.1, side: 'left' }), 1100);
-  setTimeout(() => fireSlap({ type: 'hook', growth: 1.1, side: 'right' }), 1800);
+  setTimeout(
+    () => fireScriptedPunch({ type: 'uppercut', growth: 1.4, side: 'left' }),
+    300,
+  );
+  setTimeout(
+    () => fireScriptedPunch({ type: 'hook', growth: 1.1, side: 'left' }),
+    1100,
+  );
+  setTimeout(
+    () => fireScriptedPunch({ type: 'hook', growth: 1.1, side: 'right' }),
+    1800,
+  );
 };
 
 // LiveKit arena hook (src/sponsors/arena-host.js; guarded by tests/sponsors-hook.test.mjs). A remote
@@ -3072,9 +3268,18 @@ demoFlow = installDemoFlow({
     if (tracking.active) void cameraToggle();
   },
   calibrate: () => tracking.calibrate(),
+  getArmMode: () => liveArms.display,
+  setArmMode: (mode) => liveArms.setDisplay(mode),
+  openArmScan: () => quickArms.open(),
+  isArmScanOpen: () => quickArms.isOpen,
+  prepareArms: () => quickArms.prepare(),
   getTracking: () => ({
     active: tracking.active,
     calibrated: !!tracking.calibration,
+    landmarks: tracking.results?.landmarks ?? [],
+    worldLandmarks: tracking.results?.worldLandmarks ?? [],
+    handedness: tracking.results?.handedness ?? [],
+    timestamp: tracking.results?.timestamp,
     handCount:
       performance.now() - (tracking.results?.timestamp ?? 0) < 1000
         ? (tracking.results?.landmarks?.length ?? 0)

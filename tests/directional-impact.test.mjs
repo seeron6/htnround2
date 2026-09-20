@@ -7,6 +7,7 @@ import {
   DEFAULT_IMPACT_MAGNITUDE,
   MAX_PERMANENT_DISPLACEMENT,
 } from '../src/tissue-field.js';
+import { FRACTURE_LIMIT } from '../src/bone-fracture.js';
 
 function fixture() {
   const g = new THREE.SphereGeometry(1, 64, 48);
@@ -193,30 +194,41 @@ test('default and full-power strikes visibly deform both head modes, with elasti
       settle(d, 0.125);
       peaks.push(peak(d.impactRig.offset));
       assert.ok(peaks.at(-1) > 0.022, `${mode}: ${peaks.at(-1)}`);
-      settle(d, 2);
+      // The pain reaction outlasts the dent: about 2.6 s at the default strength.
+      settle(d, 3);
       if (mode === 'live' && magnitude === DEFAULT_IMPACT_MAGNITUDE)
         assert.ok(d.maxDisplacement < 0.0001);
     }
     assert.ok(peaks[1] > peaks[0] * 1.05, `${mode}: ${peaks}`);
   }
 });
-test('live damage uses strict >0.9 threshold and stays concentrated on firm support', () => {
-  let damaged = 0;
-  for (const magnitude of [0.9, 0.9001, 1]) {
+test('a live head breaks at 0.70 or more, only on bone, only slightly, and keeps it', () => {
+  let broken = 0;
+  for (const magnitude of [0.69, 0.7, 0.85, 1]) {
     const d = fixture();
     hit(d, [0, 0.09, 0.065], [0, 0, -1], magnitude);
-    settle(d, 2);
+    settle(d, 4);
     const p = peak(d.impactRig.permanent);
-    if (magnitude === 0.9) {
+    if (magnitude < 0.7) {
       assert.equal(p, 0);
+      assert.equal(d.impactRig.lastImpact.fracture, null);
       assert.ok(d.maxDisplacement < 0.0001);
     } else {
-      assert.ok(p > 0);
-      assert.ok(p > damaged);
-      damaged = p;
+      assert.equal(d.impactRig.lastImpact.fracture.bone, 'frontal');
+      assert.ok(p > broken, `${magnitude}: ${p}`);
+      assert.ok(p > 0.002 && p <= FRACTURE_LIMIT + 1e-6, `${magnitude}: ${p}`);
+      // The reaction has gone and the break has not: it is all that is left.
+      assert.ok(Math.abs(d.maxDisplacement - p) < 1e-4, `${magnitude}`);
+      broken = p;
     }
   }
-  assert.ok(damaged > 0.003);
+  // Full power on a soft cheek bruises nothing into the shape of the head.
+  const soft = fixture();
+  hit(soft, [-0.07, 0, 0.05], [0.9, 0.1, -0.4], 1);
+  settle(soft, 4);
+  assert.equal(soft.impactRig.lastImpact.fracture, null);
+  assert.equal(peak(soft.impactRig.permanent), 0);
+  assert.ok(soft.maxDisplacement < 0.0001);
 });
 test('repeated clay strikes remain finite, welded across UV seams and bounded', () => {
   const d = fixture();

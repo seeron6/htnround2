@@ -5,6 +5,7 @@ import path from 'node:path';
 import * as THREE from 'three';
 import { FaceImpactRig } from '../src/impact-rig.js';
 import { PainExpression, painEnvelope } from '../src/pain-expression.js';
+import { painDuration } from '../src/pain-rig.js';
 import { TissueField } from '../src/tissue-field.js';
 
 const anchors = {
@@ -63,7 +64,10 @@ test('pain begins after contact, remains after the dent, and recovers completely
     peak(r.offset) > 0.01,
     'a clearly visible grimace must remain after compression',
   );
+  // The ache lingers: the whole reaction to this blow runs about 2.6 s.
   r.step(1.1);
+  assert.ok(peak(r.offset) > 0.002, 'the face is still guarded');
+  r.step(painDuration(0.85) - 1.75);
   assert.ok(r.offset.every((v) => v === 0));
   assert.equal(peak(r.permanent), 0);
   strike(r);
@@ -102,9 +106,10 @@ test('eyelid skin reacts while detached eyeballs and invisible landmarks remain 
   ];
   const tissue = new TissueField(rest, indices),
     r = new PainExpression(tissue);
-  const field = r.build(anchors, anchors[50], 0.85);
-  assert.ok(peak(field) > 0.01);
-  assert.ok(field.slice(start * 3).every((v) => v === 0));
+  const poses = r.build(anchors, anchors[50], 0.85);
+  assert.ok(peak(poses.grimace) > 0.01);
+  for (const field of Object.values(poses))
+    assert.ok(field.slice(start * 3).every((v) => v === 0));
 });
 
 const capture = process.env.FACE_IMPACT_CAPTURE;

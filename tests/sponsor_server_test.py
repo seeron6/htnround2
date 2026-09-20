@@ -32,6 +32,7 @@ class SponsorServer(unittest.TestCase):
                 k: ''
                 for k in (
                     'OMNI_API_KEY',
+                    'ELEVENLABS_API_KEY',
                     'LIVEKIT_URL',
                     'LIVEKIT_API_KEY',
                     'LIVEKIT_API_SECRET',
@@ -208,7 +209,8 @@ class SponsorServer(unittest.TestCase):
         path = service.SECRETS / 'omni.json'
         self.assertEqual(private_files.holders(path), private_files.owner_only())
         self.assertEqual(
-            private_files.holders(service.SECRETS), private_files.owner_only(directory=True)
+            private_files.holders(service.SECRETS),
+            private_files.owner_only(directory=True),
         )
         config = (
             urlopen(
@@ -302,9 +304,13 @@ class SponsorServer(unittest.TestCase):
         )
         self.assertEqual(frames, 2)
         roles = [m['role'] for m in body['messages']]
-        self.assertEqual(roles, ['system', 'assistant', 'user', 'user'])
+        self.assertEqual(roles, ['system', 'user', 'user', 'user', 'user'])
+        self.assertEqual(
+            json.loads(body['messages'][1]['content'].split('\n', 1)[1]),
+            [{'role': 'assistant', 'content': 'Hands up.'}],
+        )
         vision, speech = (
-            body['messages'][-2]['content'],
+            body['messages'][-3]['content'],
             body['messages'][-1]['content'],
         )
         # One non-text modality per message: frames with telemetry text, then the spoken question alone.

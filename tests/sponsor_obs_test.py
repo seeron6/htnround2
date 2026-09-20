@@ -3,7 +3,7 @@ subprocess and its PipelineTimer stages; nothing sensitive is attached; and ever
 without a DSN. Envelopes are captured in memory, so there is no network and no real project.
 """
 
-import json, os, subprocess, sys, tempfile, threading, unittest, unittest.mock
+import json, os, subprocess, sys, tempfile, threading, time, unittest, unittest.mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -42,6 +42,17 @@ def transactions():
     return [payload for kind, payload in Memory.items if kind == 'transaction']
 
 
+def served(name, timeout=5):
+    """A service finishes its transaction after the answer is already on the wire, so a client
+    that reads the answer and looks straight away can be early. Wait for it."""
+    deadline = time.time() + timeout
+    while True:
+        found = [t for t in transactions() if t['transaction'] == name]
+        if found or time.time() > deadline:
+            return found
+        time.sleep(0.02)
+
+
 def streamed(kind):
     """AI spans and structured logs travel as their own batched envelope items (format v2), not inside the transaction."""
     sentry_sdk.flush()
@@ -75,6 +86,13 @@ class Handler(BaseHTTPRequestHandler):
         self.rfile.read(int(self.headers.get('Content-Length', 0)))
         Handler.child = sponsor_obs.child_env()
         body = b'{"ok":true}'
+        if self.path == '/api/crash':
+            # What the real services do: swallow the exception, answer with a sentence.
+            body = b'{"error":"Conversion failed. Check the server log."}'
+            self.send_response(500)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            return self.wfile.write(body)
         self.send_response(202)
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
@@ -105,9 +123,9 @@ class Observability(unittest.TestCase):
                 'sentry-trace': TRACE + '-' + PARENT + '-1',
             },
         )
+        Memory.items.clear()
         self.assertEqual(urlopen(request, timeout=10).status, 202)
-        sentry_sdk.flush()
-        sent = transactions()
+        sent = served('POST /api/face-train')
         self.assertEqual(len(sent), 1)
         event = sent[0]
         trace = event['contexts']['trace']
@@ -213,11 +231,22 @@ class Observability(unittest.TestCase):
         for name in (
             'POST /physics/open',
             'POST /api/face-train',
+            'POST /api/meshy-train',
+            'meshy.build',
             'build_photo_face',
             'POST /sponsors/coach/turn',
         ):
             self.assertEqual(
                 sponsor_obs._sampler({'transaction_context': {'name': name}}), 1.0
+            )
+        # Status polls run every few seconds for as long as a build does.
+        for name in (
+            'GET /api/meshy-job',
+            'GET /api/face-status',
+            'GET /api/arm-status',
+        ):
+            self.assertEqual(
+                sponsor_obs._sampler({'transaction_context': {'name': name}}), 0.05
             )
 
     def test_5_coach_calls_are_shaped_for_ai_monitoring(self):
@@ -293,6 +322,11 @@ class Observability(unittest.TestCase):
             "assert 'SENTRY_TRACE' not in o.child_env()\n"
             "with o.continue_from_env('x') as t:assert t is None\n"
             "with o.ai_span('m','s') as s:o.ai_usage(s,None,1,0)\n"
+            "with o.agent_span('a','m') as a:\n"
+            "  with o.tool_span('t',parent=a) as t:assert a is None and t is None\n"
+            "o.metric('m',1.5,'millisecond',k='v');o.count('c',k='v');o.warn('w',k=1)\n"
+            "f=lambda:7\n"
+            "assert o.traced(f,'job') is f and o.job_state({'stage':'x'}) is None\n"
             "print('noop-ok')"
         )
         env = {k: v for k, v in os.environ.items() if not k.startswith('SENTRY')}
@@ -310,7 +344,195 @@ class Observability(unittest.TestCase):
                 text=True,
                 timeout=60,
             )
-        self.assertEqual(result.stdout.strip(), 'noop-ok', result.stderr)
+        self.assertEqual(
+            result.stdout.strip().splitlines()[-1], 'noop-ok', result.stderr
+        )
+
+    def test_7_a_punch_reads_as_one_agent_run_with_its_tool_call_beside_the_reply(self):
+        """The Face's turn: the spoken reply and the expression call run in different threads,
+        and must still sit side by side under one invoke_agent span."""
+        Memory.items.clear()
+        with sentry_sdk.start_transaction(
+            op='http.server', name='POST /sponsors/coach/turn'
+        ):
+            with (
+                sponsor_obs.agent_span(
+                    'The Face', 'qwen3.5-omni-flash', mode='face', trigger='combo'
+                ) as turn,
+                sponsor_obs.ai_span(
+                    'qwen3.5-omni-flash', 'yibuapi', agent='The Face'
+                ) as chat,
+            ):
+
+                def express():
+                    with sponsor_obs.ai_span(
+                        'qwen3.5-omni-flash',
+                        'yibuapi',
+                        agent='The Face',
+                        parent=turn,
+                        purpose='expression',
+                    ) as span:
+                        sponsor_obs.ai_usage(
+                            span,
+                            {'prompt_tokens': 300, 'completion_tokens': 12},
+                            410,
+                            0,
+                            finish_reason='tool_calls',
+                            model='qwen3.5-omni-flash',
+                        )
+                    with sponsor_obs.tool_span(
+                        'set_expression', agent='The Face', parent=turn, emotion='smug'
+                    ):
+                        pass
+
+                mood = threading.Thread(target=express)
+                mood.start()
+                mood.join()
+                sponsor_obs.ai_usage(
+                    chat,
+                    {'prompt_tokens': 900, 'completion_tokens': 40},
+                    1312,
+                    6,
+                    finish_reason='stop',
+                    model='qwen3.5-omni-flash',
+                )
+        spans = streamed('span')
+        op = lambda s: s['attributes']['sentry.op']['value']
+        agent = next(s for s in spans if op(s) == 'gen_ai.invoke_agent')
+        self.assertEqual(agent['name'], 'invoke_agent The Face')
+        self.assertEqual(agent['attributes']['gen_ai.agent.name']['value'], 'The Face')
+        inside = [s for s in spans if s.get('parent_span_id') == agent['span_id']]
+        self.assertEqual(
+            sorted(op(s) for s in inside),
+            ['gen_ai.chat', 'gen_ai.chat', 'gen_ai.execute_tool'],
+            'the expression call and its tool must be siblings of the spoken reply',
+        )
+        tool = next(s for s in inside if op(s) == 'gen_ai.execute_tool')
+        self.assertEqual(
+            tool['attributes']['gen_ai.tool.name']['value'], 'set_expression'
+        )
+        self.assertEqual(tool['attributes']['tool.emotion']['value'], 'smug')
+        spoken = next(
+            s
+            for s in inside
+            if s['attributes'].get('gen_ai.response.finish_reasons', {}).get('value')
+            == 'stop'
+        )
+        # The names Sentry's AI views read: seconds, not ms, and a cost the gateway's model needs from us.
+        self.assertAlmostEqual(
+            spoken['attributes']['gen_ai.response.time_to_first_token']['value'], 1.312
+        )
+        self.assertAlmostEqual(
+            spoken['attributes']['gen_ai.cost.total_tokens']['value'],
+            round(900 * 0.10 / 1e6 + 40 * 0.30 / 1e6, 6),
+            places=6,
+        )
+        self.assertEqual({s['trace_id'] for s in spans}, {agent['trace_id']})
+
+    def test_8_a_background_build_is_its_own_transaction_in_the_clicks_trace(self):
+        """A Meshy build outlives its request by minutes. It must continue that request's trace,
+        show a span per stage, and a failure must mark both the stage and the job."""
+        Memory.items.clear()
+        done = threading.Event()
+
+        def build(fail):
+            sponsor_obs.job_state({'status': 'running', 'stage': 'upload'})
+            sponsor_obs.job_state(
+                {'status': 'running', 'stage': 'generating', 'progress': 40}
+            )
+            sponsor_obs.job_state(
+                {'status': 'running', 'stage': 'generating', 'progress': 90}
+            )
+            if fail:
+                sponsor_obs.job_state({'status': 'failed', 'message': 'Meshy said no.'})
+            else:
+                sponsor_obs.job_state(
+                    {'status': 'complete', 'stage': 'complete', 'consumedCredits': 30}
+                )
+            done.set()
+
+        for fail in (False, True):
+            done.clear()
+            with sentry_sdk.start_transaction(
+                op='http.server', name='POST /api/meshy-train'
+            ) as request:
+                worker = threading.Thread(
+                    target=sponsor_obs.traced(build, 'meshy.build', op='job.meshy'),
+                    args=(fail,),
+                )
+                worker.start()
+            # The request is over and sent before the job is: exactly what happens for real.
+            worker.join()
+            self.assertTrue(done.is_set())
+            job = next(t for t in transactions() if t['transaction'] == 'meshy.build')
+            self.assertEqual(job['contexts']['trace']['trace_id'], request.trace_id)
+            self.assertEqual(
+                job['contexts']['trace']['parent_span_id'], request.span_id
+            )
+            stages = [s['description'] for s in job['spans'] if s['op'] == 'job.stage']
+            self.assertEqual(stages, ['upload', 'generating'])
+            self.assertEqual(
+                job['contexts']['trace'].get('status'),
+                'internal_error' if fail else 'ok',
+            )
+            if fail:
+                self.assertEqual(job['spans'][-1]['status'], 'internal_error')
+                self.assertTrue(
+                    any(
+                        log['body'] == 'job failed'
+                        and log['attributes']['reason']['value'] == 'Meshy said no.'
+                        for log in streamed('log')
+                    )
+                )
+            Memory.items.clear()
+
+    def test_9_every_answer_names_its_trace_and_numbers_travel_as_metrics(self):
+        Memory.items.clear()
+        request = Request(
+            'http://127.0.0.1:%d/api/save' % self.server.server_address[1],
+            data=b'{}',
+            headers={'Content-Type': 'application/json'},
+        )
+        with urlopen(request, timeout=10) as response:
+            named = response.headers.get('X-Sentry-Trace-Id')
+        answered = served('POST /api/save')[0]
+        self.assertEqual(named, answered['contexts']['trace']['trace_id'])
+        sponsor_obs.metric(
+            'coach.first_token', 1312, 'millisecond', voice_engine='omni', skipped=None
+        )
+        sponsor_obs.count('coach.turn', outcome='ok')
+        metrics = {m['name']: m for m in streamed('trace_metric')}
+        self.assertEqual(metrics['coach.first_token']['type'], 'distribution')
+        self.assertEqual(metrics['coach.first_token']['value'], 1312.0)
+        self.assertEqual(metrics['coach.first_token']['unit'], 'millisecond')
+        self.assertEqual(
+            metrics['coach.first_token']['attributes']['voice_engine']['value'], 'omni'
+        )
+        self.assertNotIn('skipped', metrics['coach.first_token']['attributes'])
+        self.assertEqual(metrics['coach.turn']['type'], 'counter')
+        self.assertTrue(str(sponsor_obs.release()).startswith('punching-face@'))
+
+    def test_a_swallowed_crash_still_opens_an_issue_tied_to_its_trace(self):
+        Memory.items.clear()
+        request = Request(
+            'http://127.0.0.1:%d/api/crash' % self.server.server_address[1],
+            data=b'{}',
+            headers={'Content-Type': 'application/json'},
+        )
+        with self.assertRaises(Exception):
+            urlopen(request, timeout=10)
+        crashed = served('POST /api/crash')[0]
+        self.assertEqual(crashed['contexts']['trace']['status'], 'internal_error')
+        issue = next(payload for kind, payload in Memory.items if kind == 'event')
+        self.assertEqual(issue['message'], 'POST /api/crash answered 500')
+        self.assertEqual(issue['level'], 'error')
+        self.assertEqual(
+            issue['contexts']['trace']['trace_id'],
+            crashed['contexts']['trace']['trace_id'],
+        )
+        self.assertNotIn(
+            'Conversion failed', json.dumps(issue)
+        )  # no response body either
 
 
 if __name__ == '__main__':

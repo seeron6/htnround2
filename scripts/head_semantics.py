@@ -12,8 +12,9 @@ from openai_capture import request
 from face_pipeline import atomic
 from scripts.astra_head_completion import obj, num, POINT
 from scripts.photo_detail import prepare_detail_frames, detail_image
+from scripts.parallel_annotations import request_views
 
-VERSION = 1
+VERSION = 2
 POLYGON = {'type': 'array', 'items': POINT, 'minItems': 0, 'maxItems': 24}
 EAR = obj(
     {
@@ -121,13 +122,17 @@ def analyze(folder, completion):
                 },
             ]
         )
-    result = request(
+    result = request_views(
         content,
         SCHEMA,
+        names,
+        request,
+        label='ears-glasses',
+        cache=folder / 'annotation-cache' / 'ears-glasses',
         model_override='gpt-6-astra',
         reasoning='low',
         max_output_tokens=24000,
-        timeout=600,
+        timeout=90,
     )
     if {v['filename'] for v in result['views']} != set(names):
         raise ValueError('Semantic review did not return the exact requested frames.')

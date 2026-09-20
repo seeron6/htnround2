@@ -238,6 +238,8 @@ class PrefetchTests(unittest.TestCase):
                 first = self.requests.count(name) == 1
             time.sleep(0.4)
             if fail_first and first:
+                if isinstance(fail_first, Exception):
+                    raise fail_first
                 raise ValueError('rate limited')
             with self.lock:
                 self.cache[key] = {
@@ -256,7 +258,7 @@ class PrefetchTests(unittest.TestCase):
 
         return run
 
-    def build(self, shuffle=False, fail_hair=False):
+    def build(self, shuffle=False, fail_hair=False, fail_semantics=False):
         completion_module, semantics_module = self.modules
 
         def request(content, *a, **k):
@@ -291,7 +293,7 @@ class PrefetchTests(unittest.TestCase):
             self.cache['eyes'] = {'eyes': {}}
             return self.cache['eyes']
 
-        semantics_module.analyze = self.stage('semantics')
+        semantics_module.analyze = self.stage('semantics', fail_semantics)
         build = SimpleNamespace(
             recover=lambda folder, status: ('rec', {}),
             complete=complete,
@@ -326,12 +328,30 @@ class PrefetchTests(unittest.TestCase):
         )
         self.assertLess(seconds, 1.0)
 
-    def test_a_failed_prefetch_falls_back_to_the_serial_call(self):
-        seconds, advice, hair, semantics = self.run_pipeline(
-            *self.build(fail_hair=True)
-        )
-        self.assertEqual(self.requests.count('hair'), 2)
-        self.assertEqual(hair['stage'], 'hair')
+    def test_a_failed_prefetch_does_not_repeat_the_entire_wait(self):
+        with self.assertRaises(ValueError):
+            self.run_pipeline(*self.build(fail_hair=True))
+        self.assertEqual(self.requests.count('hair'), 1)
+
+    def test_exhausted_hair_rate_limit_does_not_repeat_the_analyzer(self):
+        from openai_capture import OpenAIRateLimitError
+
+        failure = OpenAIRateLimitError('OpenAI temporary rate limit remains active.')
+        with self.assertRaises(OpenAIRateLimitError) as caught:
+            self.run_pipeline(*self.build(fail_hair=failure))
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(self.requests.count('hair'), 1)
+        self.assertEqual(self.requests.count('semantics'), 1)
+
+    def test_exhausted_semantic_rate_limit_does_not_repeat_the_analyzer(self):
+        from openai_capture import OpenAIRateLimitError
+
+        failure = OpenAIRateLimitError('OpenAI quota or billing limit is exhausted.')
+        with self.assertRaises(OpenAIRateLimitError) as caught:
+            self.run_pipeline(*self.build(fail_semantics=failure))
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(self.requests.count('semantics'), 1)
+        self.assertEqual(self.requests.count('hair'), 1)
 
     def test_prefetch_can_be_switched_off(self):
         import os

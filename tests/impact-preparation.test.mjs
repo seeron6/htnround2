@@ -174,12 +174,12 @@ test('progressive poses retain their age, finish at the exact endpoint, and cann
   rig.reset();
   rig.impact(rig.tissue.rest, input, 0.75);
   reply({ stage: 'preview', event: { ...preview }, affected: 1 });
-  rig.step(2);
+  rig.step(3);
   reply({ stage: 'complete', event: { ...complete }, affected: 1 });
   assert.equal(rig.events.length, 0);
 });
 
-test('reset, reconfiguration, and disposal ignore outdated worker replies and bound the queue', async () => {
+test('reset, reconfiguration, and disposal ignore outdated worker replies', async () => {
   const sent = [],
     replies = [],
     fake = { postMessage: (m) => sent.push(m), terminate() {} };
@@ -191,7 +191,7 @@ test('reset, reconfiguration, and disposal ignore outdated worker replies and bo
     );
   assert.equal(
     broker.request(emptyContact, 0.75, true, () => {}),
-    false,
+    true,
   );
   const old = sent.at(-1);
   broker.invalidate();
@@ -224,6 +224,57 @@ test('an unavailable worker fails queued jobs once and permits synchronous fallb
     broker.request(emptyContact, 0.75, true, () => {}),
     false,
   );
+  broker.dispose();
+});
+
+test('a rapid burst preserves every contact while only four unique solves run at once', () => {
+  const sent = [],
+    replies = [];
+  const fake = { postMessage: (message) => sent.push(message), terminate() {} };
+  const broker = new ImpactPreparation({}, { makeWorker: () => fake });
+  for (let i = 0; i < 20; i++)
+    assert.equal(
+      broker.request({ ...emptyContact, magnitude: 0.5 + i / 100 }, 0.75, true, () =>
+        replies.push(i),
+      ),
+      true,
+    );
+  assert.equal(sent.filter((m) => m.type === 'impact').length, 4);
+  for (let i = 0; i < 20; i++) {
+    const job = sent.filter((m) => m.type === 'impact')[i];
+    fake.onmessage({
+      data: { id: job.id, epoch: job.epoch, stage: 'complete', event: {} },
+    });
+    assert.ok(broker.inFlight <= 4);
+  }
+  assert.equal(replies.length, 20);
+  assert.equal(broker.pending.size, 0);
+  broker.dispose();
+});
+
+test('identical pending punches share computation but receive independent reaction events', () => {
+  const sent = [],
+    previews = [],
+    complete = [];
+  const fake = { postMessage: (message) => sent.push(message), terminate() {} };
+  const broker = new ImpactPreparation({}, { makeWorker: () => fake });
+  const receive = (r) => (r.stage === 'preview' ? previews : complete).push(r.event);
+  for (let i = 0; i < 10; i++) broker.request(emptyContact, 0.75, true, receive);
+  assert.equal(sent.filter((m) => m.type === 'impact').length, 1);
+  const job = sent.at(-1);
+  fake.onmessage({
+    data: { id: job.id, epoch: job.epoch, stage: 'preview', event: { age: 0 } },
+  });
+  previews[0].age = 0.5;
+  broker.request(emptyContact, 0.75, true, receive);
+  assert.equal(previews.length, 11);
+  assert.equal(previews[10].age, 0);
+  assert.notEqual(previews[0], previews[1]);
+  fake.onmessage({
+    data: { id: job.id, epoch: job.epoch, stage: 'complete', event: { age: 0 } },
+  });
+  assert.equal(complete.length, 11);
+  assert.equal(new Set(complete).size, 11);
   broker.dispose();
 });
 

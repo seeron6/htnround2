@@ -1,4 +1,5 @@
 import { SurfaceValidity } from './surface-validity.js';
+import { fractureField } from './bone-fracture.js';
 // Surface-connected, seam-welded tissue field. Parameters are animation controls,
 // not material measurements. See docs/IMPACT_RIG.md for sources and limits.
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
@@ -153,12 +154,16 @@ export class TissueField {
     const cheek = Math.max(g(a[50], 0.041, 0.037, 0.04), g(a[280], 0.041, 0.037, 0.04));
     const lips = g(mouth, 0.036, 0.016, 0.022),
       nose = a[1] ?? [mouth[0], mouth[1] + 0.043 * s, mouth[2] + 0.014 * s];
-    const bridge = g(
-      [nose[0], nose[1] + 0.015 * s, nose[2] - 0.008 * s],
-      0.018,
-      0.031,
-      0.025,
-    );
+    // Heads without a measured nose tip only have an estimate of where it is, and
+    // a real nose stands further out than that. Skin ahead of the estimate, on the
+    // midline between lip and brow, is still the nose: only count depth behind it.
+    const ridge = nose[2] - 0.008 * s,
+      bridge = g(
+        [nose[0], nose[1] + 0.015 * s, Math.max(ridge, p[2])],
+        0.018,
+        0.031,
+        0.025,
+      );
     const zygoma = Math.max(
       ...[50, 280].map((id) =>
         g([a[id][0], a[id][1] + 0.023 * s, a[id][2] - 0.004 * s], 0.03, 0.02, 0.03),
@@ -181,8 +186,9 @@ export class TissueField {
     );
     const upper = smooth(mouth[1] + 0.085 * s, mouth[1] + 0.12 * s, p[1]);
     const back = 1 - smooth(mouth[2] - 0.075 * s, mouth[2] - 0.035 * s, p[2]);
+    const firm = 1 - lips * 0.98;
     const bone = clamp(
-      Math.max(bridge, zygoma, mandible, temples, upper, back) * (1 - lips * 0.98),
+      Math.max(bridge, zygoma, mandible, temples, upper, back) * firm,
       0,
       1,
     );
@@ -191,6 +197,15 @@ export class TissueField {
       cheek,
       lips,
       bone,
+      // Which bone that is: src/bone-fracture.js breaks each one differently.
+      bones: {
+        nasal: bridge * firm,
+        zygoma: zygoma * firm,
+        mandible: mandible * firm,
+        temple: temples * firm,
+        frontal: upper * firm,
+        occipital: back * firm,
+      },
       compliance: clamp(0.35 + 0.55 * cheek + 0.5 * lips - 0.22 * bone, 0.18, 1),
     };
   }
@@ -206,9 +221,11 @@ export class TissueField {
     const tangent = direction.map((x, j) => x + normal[j] * incidence);
     const radius = (0.026 + 0.019 * magnitude) * s,
       distance = this.distances(seed, radius * 3.3);
-    const values = new Float32Array(this.vertices.length * 3),
-      damage = new Float32Array(values.length);
-    const amplitude = 1.65 * Math.pow(magnitude, 1.12) * (0.72 + 0.46 * softness) * s;
+    const values = new Float32Array(this.vertices.length * 3);
+    // Linear in magnitude: the old 1.12 exponent quietly halved everything below a
+    // full-power blow, which is where every tracked punch actually lands. A hard hit
+    // is unchanged; a light one now shows.
+    const amplitude = 1.65 * magnitude * (0.72 + 0.46 * softness) * s;
     let affected = 0;
     this.vertices.forEach((v, i) => {
       const d = distance[i];
@@ -229,20 +246,30 @@ export class TissueField {
       for (let j = 0; j < 3; j++)
         values[i * 3 + j] =
           amplitude * (-normal[j] * depth + tangent[j] * shear + v.n[j] * bulge);
-      if (magnitude > 0.9) {
-        const severity = (magnitude - 0.9) / 0.1,
-          patch = Math.exp(-((d / (radius * 0.88)) ** 2));
-        const amount = 0.016 * s * severity * patch * local.bone * material.bone;
-        for (let j = 0; j < 3; j++)
-          damage[i * 3 + j] = amount * (-normal[j] * incidence + tangent[j] * 0.45);
-      }
       if (broad > 0.02) affected += v.copies.length;
     });
     // The complete field is constrained after facial correctives are added.
-    if (magnitude > 0.9) this.limitGradient(damage, 0.45);
+    // A hard blow on bone also leaves a slight, lasting break.
+    const fracture = fractureField(this, {
+      seed,
+      direction,
+      normal,
+      incidence,
+      magnitude,
+      materials,
+      anchors,
+    });
     return {
       field: this.expand(values),
-      damage: this.expand(damage),
+      damage: fracture
+        ? this.expand(fracture.damage)
+        : new Float32Array(this.rest.length),
+      swelling: fracture ? this.expand(fracture.swelling) : null,
+      fracture: fracture && {
+        bone: fracture.bone,
+        side: fracture.side,
+        severity: fracture.severity,
+      },
       affected,
       material,
       normal,
@@ -250,7 +277,7 @@ export class TissueField {
       seed,
     };
   }
-  limitGradient(values, limit = 0.78) {
+  limitGradient(values, limit = 0.78, nodes = null) {
     // Local Lipschitz envelopes bound each component along surface edges. Taking
     // their midpoint smooths only over-steep regions instead of shrinking every
     // dent to satisfy the worst edge. Dijkstra propagation converges in one solve
@@ -263,13 +290,18 @@ export class TissueField {
         const envelope = new Float64Array(count),
           heap = new Heap();
         for (let i = 0; i < count; i++) envelope[i] = sign * values[i * 3 + axis];
-        for (let i = 0; i < count; i++)
+        // `nodes` lists every node a local field touches, with a margin: nothing
+        // outside it can be too steep, so the scan of the whole head is skipped.
+        const seed = (i) => {
           if (
             this.vertices[i].links.some(
               ([j, length]) => envelope[j] > envelope[i] + slope * length + 1e-10,
             )
           )
             heap.push([envelope[i], i]);
+        };
+        if (nodes) for (const i of nodes) seed(i);
+        else for (let i = 0; i < count; i++) seed(i);
         while (heap.data.length) {
           const [value, i] = heap.pop();
           if (value > envelope[i] + 1e-10) continue;
@@ -340,7 +372,7 @@ export class TissueField {
       finite: positions.every(Number.isFinite),
     };
   }
-  fitIncrement(base, increment) {
+  fitIncrement(base, increment, limit = MAX_PERMANENT_DISPLACEMENT) {
     if (!increment.some((v) => v !== 0)) return;
     if (!base.some((v) => v !== 0)) {
       this.validity.constrain(increment);
@@ -348,8 +380,8 @@ export class TissueField {
     } // also protect the first retained damage field
     const total = new Float32Array(base.length);
     for (let i = 0; i < total.length; i++) total[i] = base[i] + increment[i];
-    this.constrainAccumulation(total, MAX_PERMANENT_DISPLACEMENT, 0.86, false);
-    this.validity.constrainRelative(total, base, MAX_PERMANENT_DISPLACEMENT);
+    this.constrainAccumulation(total, limit, 0.86, false);
+    this.validity.constrainRelative(total, base, limit);
     for (let i = 0; i < increment.length; i++) increment[i] = total[i] - base[i];
   }
   constrainAccumulation(field, limit = 0.055, gradient = 0.88, protectArea = true) {

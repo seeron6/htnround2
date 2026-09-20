@@ -19,7 +19,9 @@
     "sponsors": "node scripts/py.mjs sponsor_server.py",
     "livekit:dev": "livekit-server --dev --bind 127.0.0.1",
     "build:guest": "vite build --config vite.guest.config.js",
-    "test:sponsors": "node scripts/py.mjs tests/sponsor_server_test.py && node scripts/py.mjs tests/sponsor_obs_test.py",
+    "test:sponsors": "node scripts/py.mjs tests/sponsor_server_test.py && node scripts/py.mjs tests/sponsor_obs_test.py && node scripts/py.mjs tests/face_voice_test.py && node scripts/py.mjs tests/sentry_turn_test.py && node scripts/py.mjs tests/pipeline_failure_test.py",
+    "sentry:doctor": "node scripts/py.mjs scripts/sentry_doctor.py",
+    "sentry:sink": "node scripts/py.mjs scripts/sentry_sink.py",
     "omni:smoke": "node scripts/py.mjs scripts/omni_smoke_test.py",
     "omni:report": "node scripts/py.mjs scripts/omni_usage_report.py",
     "omni:relay": "node scripts/py.mjs omni_relay.py"

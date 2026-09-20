@@ -42,6 +42,15 @@ def atomic(path, data):
     tmp.replace(path)
 
 
+def require_head_capture(manifest):
+    if manifest.get('captureRegion') != 'head':
+        raise ValueError(
+            'This older scan contains face-only crops. Import or record whole-head '
+            'views including hair, ears, both sides and the back; facial crops '
+            'cannot produce a completed head.'
+        )
+
+
 def interrupt_timing(folder):
     path = folder / 'timing.json'
     if not path.exists():
@@ -114,7 +123,33 @@ class FaceStore:
             raise ValueError('Face scan not found.')
         return folder
 
-    def create(self, fov=None, capture_region="face"):
+    @staticmethod
+    def validate_name(name):
+        if not isinstance(name, str):
+            raise ValueError('Head name must be text.')
+        name = ' '.join(name.split())
+        if not 1 <= len(name) <= 80:
+            raise ValueError('Use a head name between 1 and 80 characters.')
+        return name
+
+    def name(self, identifier):
+        folder = self.folder(identifier)
+        path = folder / 'head-name.json'
+        if path.exists():
+            return json.loads(path.read_text()).get('name', '')
+        return json.loads((folder / 'capture.json').read_text()).get('name', '')
+
+    def rename(self, identifier, name):
+        name = self.validate_name(name)
+        with self.lock:
+            # Keep display metadata separate from files rewritten by capture workers.
+            # Renaming also preserves the scan's saved date and library ordering.
+            atomic(self.folder(identifier) / 'head-name.json', {'name': name})
+        return {'id': identifier, 'name': name}
+
+    def create(self, fov=None, capture_region="head", name=None):
+        if name is not None:
+            name = self.validate_name(name)
         if capture_region not in ("face", "head"):
             raise ValueError("Unknown capture region.")
         if fov is not None and (
@@ -125,8 +160,8 @@ class FaceStore:
             raise ValueError('Camera field of view must be 10–120 degrees, or blank.')
         with self.lock:
             folder = self.root / uuid.uuid4().hex
-            for name in ('images', 'masks'):
-                (folder / name).mkdir(parents=True, exist_ok=True)
+            for subdir in ('images', 'masks'):
+                (folder / subdir).mkdir(parents=True, exist_ok=True)
             atomic(
                 folder / 'capture.json',
                 {
@@ -145,7 +180,9 @@ class FaceStore:
                     'message': 'Ready to receive face frames.',
                 },
             )
-            return {'id': folder.name, 'frames': 0}
+            if name is not None:
+                self.rename(folder.name, name)
+            return {'id': folder.name, 'frames': 0, 'name': name or ''}
 
     def append(self, identifier, frames):
         if not isinstance(frames, list) or not 1 <= len(frames) <= 6:
@@ -320,6 +357,7 @@ class FaceStore:
                             'testFixture': bool(data.get('testFixture')),
                             **coverage(data['frames']),
                             **state,
+                            'name': self.name(folder.name),
                             'photoModel': has_published_model(folder),
                             'savedAt': (folder / 'capture.json').stat().st_mtime,
                         }
@@ -332,7 +370,10 @@ class FaceStore:
         with self.lock:
             folder = self.folder(identifier)
             if data is not None:
-                if identifier in self.jobs and data.get('kind') != 'load':
+                if identifier in self.jobs and data.get('kind') not in (
+                    'load',
+                    'ready',
+                ):
                     raise ValueError(
                         'Timing metadata cannot change during reconstruction.'
                     )
@@ -356,6 +397,18 @@ class FaceStore:
                         if (folder / 'source.json').exists()
                         else {}
                     )
+                    upload_started = data.get('uploadStartedAt')
+                    if upload_started is not None:
+                        if (
+                            not isinstance(upload_started, (int, float))
+                            or isinstance(upload_started, bool)
+                            or not math.isfinite(upload_started)
+                            or not 0 < upload_started <= time.time() + 60
+                        ):
+                            raise ValueError('Invalid upload start time.')
+                        # The first timestamp includes initialization and upload;
+                        # later extraction metadata must not reset that clock.
+                        previous.setdefault('uploadStartedAt', upload_started)
                     atomic(
                         folder / 'source.json',
                         {
@@ -368,6 +421,32 @@ class FaceStore:
                             is True,
                         },
                     )
+                elif data.get('kind') == 'ready':
+                    observed = data.get('at')
+                    if (
+                        not isinstance(observed, (int, float))
+                        or isinstance(observed, bool)
+                        or not math.isfinite(observed)
+                        or not 0 < observed <= time.time() + 60
+                    ):
+                        raise ValueError('Invalid ready observation time.')
+                    path = folder / 'timing.json'
+                    if path.exists():
+                        timing = json.loads(path.read_text())
+                        if timing.get('status') == 'complete':
+                            model_ready = timing.get('requestedAt', 0) + timing.get(
+                                'reconstructionSeconds', 0
+                            )
+                            if observed < model_ready - 1:
+                                raise ValueError(
+                                    'Ready observation precedes completion.'
+                                )
+                            # The dialog and background tracker can observe the same
+                            # completion concurrently. Keep the earliest observation.
+                            previous = timing.get('readyObservedAt')
+                            if previous is None or observed < previous:
+                                timing['readyObservedAt'] = round(observed, 3)
+                                atomic(path, timing)
                 elif data.get('kind') == 'load':
                     seconds = data.get('seconds')
                     if (
@@ -476,7 +555,9 @@ class FaceStore:
     def train(self, identifier, cloud, refine=False):
         with self.lock:
             folder = self.folder(identifier)
-            frames = json.loads((folder / 'capture.json').read_text())['frames']
+            manifest = json.loads((folder / 'capture.json').read_text())
+            require_head_capture(manifest)
+            frames = manifest['frames']
             c = coverage(frames)
             if len(frames) < 24:
                 raise ValueError('Capture at least 24 sharp views; aim for 60–100.')
@@ -666,6 +747,7 @@ class FaceStore:
                     **json.loads((folder / 'status.json').read_text()),
                     **self.timing(identifier),
                     'photoModel': has_published_model(folder),
+                    'name': self.name(identifier),
                 }
             if path == '/api/face-asset':
                 from head_artifacts import published_folder, release_manifest
@@ -725,8 +807,12 @@ class FaceStore:
                 return 200, test_connection()
             if path == '/api/face-captures':
                 return 201, self.create(
-                    data.get('horizontalFovDegrees'), data.get('captureRegion', 'face')
+                    data.get('horizontalFovDegrees'),
+                    data.get('captureRegion', 'head'),
+                    data.get('name'),
                 )
+            if path == '/api/face-rename':
+                return 200, self.rename(identifier, data.get('name'))
             if path == '/api/face-frames':
                 return 201, self.append(identifier, data.get('frames'))
             if path == '/api/face-timing':

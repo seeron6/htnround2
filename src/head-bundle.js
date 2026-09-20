@@ -1,3 +1,5 @@
+import { requireCompleteHead } from './head-completeness.js';
+
 // Pin every asset and the Newton session to one accepted reconstruction.
 export async function loadHeadBundle(id, fetcher = fetch) {
   const base = `/api/face-asset?id=${encodeURIComponent(id)}`;
@@ -34,6 +36,7 @@ export async function loadHeadBundle(id, fetcher = fetch) {
     json('physics-cage.json'),
     read('appearance.png'),
   ]);
+  requireCompleteHead(data.stats, atlas.stats);
   if (
     (atlas.textureSha256 && (await digest(textureBytes)) !== atlas.textureSha256) ||
     (atlas.positionsSha256 &&
